@@ -86,11 +86,12 @@ export function qdrantFetchMode(
   // Full semver shape required (prerelease/build tags allowed): a partial
   // match like `1.19.not-a-version` is NOT a version the registry could
   // have served, so transport selection fails closed rather than guessing.
-  const identifier = "(?:0|[1-9]\\d*|[A-Za-z-][0-9A-Za-z-]*)";
+  const numericIdentifier = "(?:0|[1-9]\\d*)";
+  const prereleaseIdentifier = `(?:${numericIdentifier}|\\d*[A-Za-z-][0-9A-Za-z-]*)`;
   const match = clientVersion.match(
     new RegExp(
-      `^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)` +
-        `(?:-${identifier}(?:\\.${identifier})*)?` +
+      `^(${numericIdentifier})\\.(${numericIdentifier})\\.${numericIdentifier}` +
+        `(?:-${prereleaseIdentifier}(?:\\.${prereleaseIdentifier})*)?` +
         "(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
     ),
   );

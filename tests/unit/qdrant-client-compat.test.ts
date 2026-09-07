@@ -67,10 +67,17 @@ describe("qdrant-client-compat", () => {
       // legitimately serves.
       expect(qdrantFetchMode(26, "1.19.0-rc.1")).toBe("native");
       expect(qdrantFetchMode(26, "1.18.2+build.5")).toBe("paired-undici");
+      expect(qdrantFetchMode(26, "1.18.0-1a")).toBe("paired-undici");
     });
 
     it("fails closed for malformed prerelease and build metadata", () => {
-      for (const version of ["1.19.0-", "1.19.0+", "1.19.0-alpha..1", "1.19.0+meta."]) {
+      for (const version of [
+        "1.19.0-",
+        "1.19.0+",
+        "1.19.0-01",
+        "1.19.0-alpha..1",
+        "1.19.0+meta.",
+      ]) {
         expect(qdrantFetchMode(26, version), version).toBe("unknown");
       }
     });
