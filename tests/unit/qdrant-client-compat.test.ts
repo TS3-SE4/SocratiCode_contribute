@@ -69,6 +69,12 @@ describe("qdrant-client-compat", () => {
       expect(qdrantFetchMode(26, "1.18.2+build.5")).toBe("paired-undici");
     });
 
+    it("fails closed for malformed prerelease and build metadata", () => {
+      for (const version of ["1.19.0-", "1.19.0+", "1.19.0-alpha..1", "1.19.0+meta."]) {
+        expect(qdrantFetchMode(26, version), version).toBe("unknown");
+      }
+    });
+
     it("keeps native fetch for a non-finite Node major", () => {
       expect(qdrantFetchMode(Number.NaN, "1.18.0")).toBe("native");
     });
