@@ -2,19 +2,18 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
-  qdrantClientBreaksOnThisNode,
+  createQdrantFetchBridge,
+  qdrantFetchMode,
   readInstalledQdrantClientVersion,
 } from "../../src/services/qdrant-client-compat.js";
 
 /**
- * The startup guard refuses only the PAIR that breaks: Node 26+ with
- * @qdrant/js-client-rest < 1.19 (undici 6 vs Node 26's fetch). These tests
- * pin the pair logic and the version reader; getting either wrong turns the
- * guard back into what it replaced — a blanket Node 26 refusal that turns
- * away working installs, or a silent boot into a client whose first request
- * dies with an opaque undici error.
+ * Node 26 must pair Qdrant client 1.18's dispatcher with fetch from the same
+ * undici line, while every unaffected runtime and request keeps the native
+ * transport. The packaged-runtime CI job proves this decision against a real
+ * Qdrant from a clean consumer installation.
  */
 describe("qdrant-client-compat", () => {
   describe("readInstalledQdrantClientVersion", () => {
@@ -33,51 +32,114 @@ describe("qdrant-client-compat", () => {
     });
   });
 
-  describe("qdrantClientBreaksOnThisNode", () => {
-    it("never breaks below Node 26, whatever the client", () => {
+  describe("qdrantFetchMode", () => {
+    it("keeps native fetch below Node 26, whatever the client", () => {
       for (const version of ["1.18.0", "1.19.0", null]) {
         for (const major of [18, 20, 22, 24, 25]) {
-          expect(qdrantClientBreaksOnThisNode(major, version), `${major}/${version}`).toBe(false);
+          expect(qdrantFetchMode(major, version), `${major}/${version}`).toBe("native");
         }
       }
     });
 
-    it("breaks on Node 26+ with a pre-1.19 client", () => {
-      expect(qdrantClientBreaksOnThisNode(26, "1.18.0")).toBe(true);
-      expect(qdrantClientBreaksOnThisNode(26, "1.17.0")).toBe(true);
-      expect(qdrantClientBreaksOnThisNode(27, "1.18.5")).toBe(true);
+    it("pairs fetch on Node 26+ with a pre-1.19 client", () => {
+      expect(qdrantFetchMode(26, "1.18.0")).toBe("paired-undici");
+      expect(qdrantFetchMode(26, "1.17.0")).toBe("paired-undici");
+      expect(qdrantFetchMode(27, "1.18.5")).toBe("paired-undici");
     });
 
-    it("does not break on Node 26+ with 1.19 or newer", () => {
-      // The whole point of the versioned guard: a working install must not
-      // be turned away.
-      expect(qdrantClientBreaksOnThisNode(26, "1.19.0")).toBe(false);
-      expect(qdrantClientBreaksOnThisNode(26, "1.20.3")).toBe(false);
-      expect(qdrantClientBreaksOnThisNode(27, "2.0.0")).toBe(false);
+    it("keeps native fetch on Node 26+ with 1.19 or newer", () => {
+      expect(qdrantFetchMode(26, "1.19.0")).toBe("native");
+      expect(qdrantFetchMode(26, "1.20.3")).toBe("native");
+      expect(qdrantFetchMode(27, "2.0.0")).toBe("native");
     });
 
-    it("fails closed on Node 26+ when the version is unknown or unparseable", () => {
-      // Booting anyway would trade the guard's clear message for the opaque
-      // UND_ERR_INVALID_ARG at the first qdrant call.
-      expect(qdrantClientBreaksOnThisNode(26, null)).toBe(true);
-      expect(qdrantClientBreaksOnThisNode(26, "not-a-version")).toBe(true);
+    it("fails closed when the Node 26+ client version is unknown or unparseable", () => {
+      expect(qdrantFetchMode(26, null)).toBe("unknown");
+      expect(qdrantFetchMode(26, "not-a-version")).toBe("unknown");
       // A half-valid string must not be half-read as its leading 1.19,
       // whether the garbage starts at the patch or trails after it.
-      expect(qdrantClientBreaksOnThisNode(26, "1.19.not-a-version")).toBe(true);
-      expect(qdrantClientBreaksOnThisNode(26, "1.19.0garbage")).toBe(true);
+      expect(qdrantFetchMode(26, "1.19.not-a-version")).toBe("unknown");
+      expect(qdrantFetchMode(26, "1.19.0garbage")).toBe("unknown");
     });
 
     it("reads prerelease and build-metadata versions normally", () => {
       // The strict shape must not reject the tagged versions the registry
       // legitimately serves.
-      expect(qdrantClientBreaksOnThisNode(26, "1.19.0-rc.1")).toBe(false);
-      expect(qdrantClientBreaksOnThisNode(26, "1.18.2+build.5")).toBe(true);
+      expect(qdrantFetchMode(26, "1.19.0-rc.1")).toBe("native");
+      expect(qdrantFetchMode(26, "1.18.2+build.5")).toBe("paired-undici");
+      expect(qdrantFetchMode(26, "1.18.0-1a")).toBe("paired-undici");
     });
 
-    it("treats a non-finite node major as not breaking", () => {
-      // An unparseable process.versions.node must not brick startup on
-      // Node versions the guard was never about.
-      expect(qdrantClientBreaksOnThisNode(Number.NaN, "1.18.0")).toBe(false);
+    it("fails closed for malformed prerelease and build metadata", () => {
+      for (const version of [
+        "1.19.0-",
+        "1.19.0+",
+        "1.19.0-01",
+        "1.19.0-alpha..1",
+        "1.19.0+meta.",
+      ]) {
+        expect(qdrantFetchMode(26, version), version).toBe("unknown");
+      }
+    });
+
+    it("keeps native fetch for a non-finite Node major", () => {
+      expect(qdrantFetchMode(Number.NaN, "1.18.0")).toBe("native");
+    });
+  });
+
+  describe("createQdrantFetchBridge", () => {
+    const response = new Response(JSON.stringify({ result: true }));
+    const dispatcher = {};
+
+    it("uses paired fetch only for a Qdrant request carrying a dispatcher", async () => {
+      const nativeFetch = vi.fn(async () => response);
+      const pairedFetch = vi.fn(async () => response);
+      const bridge = createQdrantFetchBridge(
+        nativeFetch,
+        pairedFetch,
+        new Set(["http://qdrant.test:6333"]),
+      );
+      const init = { dispatcher } as RequestInit;
+
+      await bridge("http://qdrant.test:6333/collections", init);
+
+      expect(pairedFetch).toHaveBeenCalledWith("http://qdrant.test:6333/collections", init);
+      expect(nativeFetch).not.toHaveBeenCalled();
+    });
+
+    it("keeps native fetch for unrelated origins and dispatcher-free requests", async () => {
+      const nativeFetch = vi.fn(async () => response);
+      const pairedFetch = vi.fn(async () => response);
+      const bridge = createQdrantFetchBridge(
+        nativeFetch,
+        pairedFetch,
+        new Set(["http://qdrant.test:6333"]),
+      );
+      const init = { dispatcher } as RequestInit;
+
+      await bridge("https://example.com/collections", init);
+      await bridge("http://qdrant.test:6333/healthz");
+
+      expect(nativeFetch).toHaveBeenCalledTimes(2);
+      expect(pairedFetch).not.toHaveBeenCalled();
+    });
+
+    it("propagates the paired transport error without falling back", async () => {
+      const failure = new Error("transport failed");
+      const nativeFetch = vi.fn(async () => response);
+      const pairedFetch = vi.fn(async () => {
+        throw failure;
+      });
+      const bridge = createQdrantFetchBridge(
+        nativeFetch,
+        pairedFetch,
+        new Set(["http://qdrant.test:6333"]),
+      );
+
+      await expect(
+        bridge("http://qdrant.test:6333/collections", { dispatcher } as RequestInit),
+      ).rejects.toBe(failure);
+      expect(nativeFetch).not.toHaveBeenCalled();
     });
   });
 });

@@ -2,53 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-// Pre-flight: refuse to start on the PAIR known to break — Node 26+ with
-// @qdrant/js-client-rest older than 1.19. Those clients bundle undici 6, whose Agent
-// (handed to Node's built-in fetch as init.dispatcher) fails Node 26's undici-8 handler
-// validation, so every qdrant call dies with `UND_ERR_INVALID_ARG: invalid onError
-// method`. Upstream fixed this in client 1.19 by moving to undici 7
-// (https://github.com/qdrant/qdrant-js/issues/134), verified working on Node 26 against a
-// live Qdrant, so Node 26+ with client >= 1.19 starts normally; a fresh install resolves
-// a >= 1.19 client on Node 26 and never sees this refusal. The refusal remains for stale
-// installs (an old lockfile pinning a pre-1.19 client) and for an undeterminable client
-// version, where booting would trade this message for the opaque undici error later.
-//
-// This runtime guard is deliberately the ONLY gate. Do NOT add an upper bound to
-// `engines.node` in package.json. An upper bound is actively harmful here: a bare
-// `npx socraticode` install resolves a version range, and npm engine-filters that range,
-// so a `<26.0.0` bound makes Node 26 silently resolve to the newest version *below* the
-// bound (which predates this guard) and boot into the broken client instead of refusing.
-//
-// (Imports below are evaluated before this check per ESM semantics, but qdrant-js's
-// module-init is side-effect-light: only an actual request triggers the undici path, so
-// exiting here is enough to spare users the opaque error later.)
-const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
-const installedClient = readInstalledQdrantClientVersion();
-if (qdrantClientBreaksOnThisNode(nodeMajor, installedClient)) {
-  // fs.writeSync(2, …) is the canonical Node idiom for "print fatal error then die":
-  // blocking (no truncation when stderr is piped — every MCP host pipes stderr) and
-  // synchronous (so process.exit(1) runs before any further top-level code).
-  const msg =
-    `socraticode: Node ${process.versions.node} needs @qdrant/js-client-rest 1.19 or newer ` +
-    `(installed: ${installedClient ?? "undeterminable"}).\n` +
-    "  Clients before 1.19 bundle an undici incompatible with Node 26+.\n" +
-    "  Reinstall socraticode (or update its lockfile) to pick up a current client,\n" +
-    "  or use Node 22.x (via nvm: `nvm install 22 && nvm use 22`).\n" +
-    "  See https://github.com/qdrant/qdrant-js/issues/134.\n";
-  writeSync(2, msg);
-  process.exit(1);
-}
-
-import { writeSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { EXTENSION_LANGUAGE_MAP_INVALID, getWatcherMode, SOCRATICODE_VERSION } from "./constants.js";
 import { logger, setMcpLogSender } from "./services/logger.js";
-import {
-  qdrantClientBreaksOnThisNode,
-  readInstalledQdrantClientVersion,
-} from "./services/qdrant-client-compat.js";
 import { autoResumeIndexedProjects, gracefulShutdown } from "./services/startup.js";
 import { handleContextTool } from "./tools/context-tools.js";
 import { handleGraphTool } from "./tools/graph-tools.js";

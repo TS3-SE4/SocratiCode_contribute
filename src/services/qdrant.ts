@@ -16,6 +16,7 @@ import {
   withEffectiveEmbedding,
 } from "./index-profile.js";
 import { logger } from "./logger.js";
+import { ensureQdrantClientCompatibility } from "./qdrant-client-compat.js";
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
@@ -102,6 +103,9 @@ let client: QdrantClient | null = null;
 
 export function getClient(): QdrantClient {
   if (!client) {
+    const qdrantBaseUrl =
+      QDRANT_URL ?? `${QDRANT_API_KEY ? "https" : "http"}://${QDRANT_HOST}:${QDRANT_PORT}`;
+    ensureQdrantClientCompatibility(qdrantBaseUrl);
     client = new QdrantClient(
       QDRANT_URL
         ? {
