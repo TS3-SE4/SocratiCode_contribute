@@ -4,6 +4,21 @@ All notable changes to SocratiCode are documented here.
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and [Semantic Versioning](https://semver.org/).
 
 
+## [1.13.1](https://github.com/giancarloerra/socraticode/compare/v1.13.0...v1.13.1) (2026-09-07)
+
+### Bug Fixes
+
+* **qdrant:** accept valid prerelease identifiers ([b043e58](https://github.com/giancarloerra/socraticode/commit/b043e589040e07e3664db979a4f0efa36fd19bdc))
+* **qdrant:** support Node 26 without dropping Node 18 ([d7008bd](https://github.com/giancarloerra/socraticode/commit/d7008bd555c054ba48f8c8e657c788d76568d3cc))
+
+### Performance
+
+* **qdrant:** bypass bridge work for ordinary fetches ([b973c01](https://github.com/giancarloerra/socraticode/commit/b973c01de0dc27b5f913903020c37216f6e6e733))
+
+### Tests
+
+* **qdrant:** harden Node 26 compatibility checks ([e76aaae](https://github.com/giancarloerra/socraticode/commit/e76aaae35929e40461b6fad3fba9f54a76307dd3))
+
 ## [1.13.0](https://github.com/giancarloerra/socraticode/compare/v1.12.0...v1.13.0) (2026-09-07)
 
 ### Features
