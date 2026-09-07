@@ -116,10 +116,12 @@ export function createQdrantFetchBridge(
   qdrantOrigins: ReadonlySet<string>,
 ): FetchFunction {
   return (input, init) => {
-    const origin = requestOrigin(input);
     const dispatcher = (init as DispatcherRequestInit | undefined)?.dispatcher;
-    if (origin !== null && qdrantOrigins.has(origin) && dispatcher !== undefined) {
-      return pairedFetch(input, init);
+    if (dispatcher !== undefined) {
+      const origin = requestOrigin(input);
+      if (origin !== null && qdrantOrigins.has(origin)) {
+        return pairedFetch(input, init);
+      }
     }
     return nativeFetch(input, init);
   };
