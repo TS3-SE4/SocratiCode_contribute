@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        node-version: [18, 20, 22, 26]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -41,6 +41,11 @@ jobs:
   node-floor-consumer-install:
     name: Node 18.17 Consumer Install
     runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.17.0
+        ports:
+          - 6333:6333
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -53,6 +58,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          qdrant_ready=false
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:6333/healthz >/dev/null; then
+              qdrant_ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$qdrant_ready" = true
+          repo_dir="$PWD"
           consumer_dir="$(mktemp -d)"
           npm pack --pack-destination "$consumer_dir"
           package_file="$(find "$consumer_dir" -maxdepth 1 -type f -name 'socraticode-*.tgz' -print -quit)"
@@ -61,6 +76,51 @@ jobs:
           npm init --yes
           npm install --engine-strict "$package_file"
           test -f node_modules/socraticode/dist/index.js
+          SOCRATICODE_AUTO_RESUME=off node node_modules/socraticode/dist/index.js < /dev/null
+          QDRANT_MODE=external QDRANT_URL=http://127.0.0.1:6333 \
+            node "$repo_dir/scripts/verify-packaged-qdrant.mjs" "$consumer_dir/node_modules/socraticode"
+
+  node-26-consumer-qdrant:
+    name: Node 26 Packaged Qdrant Smoke
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.17.0
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Verify the unmodified package against Qdrant on Node 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          qdrant_ready=false
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:6333/healthz >/dev/null; then
+              qdrant_ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$qdrant_ready" = true
+          repo_dir="$PWD"
+          consumer_dir="$(mktemp -d)"
+          npm pack --pack-destination "$consumer_dir"
+          package_file="$(find "$consumer_dir" -maxdepth 1 -type f -name 'socraticode-*.tgz' -print -quit)"
+          test -n "$package_file"
+          cd "$consumer_dir"
+          npm init --yes
+          npm install --engine-strict "$package_file"
+          test -f node_modules/socraticode/dist/index.js
+          SOCRATICODE_AUTO_RESUME=off node node_modules/socraticode/dist/index.js < /dev/null
+          QDRANT_MODE=external QDRANT_HOST=127.0.0.1 QDRANT_PORT=6333 \
+            node "$repo_dir/scripts/verify-packaged-qdrant.mjs" "$consumer_dir/node_modules/socraticode"
 
   # The one test that asks the compiler instead of asserting what we believe.
   # It lives under tests/integration/ because it runs a real `cargo check`, and

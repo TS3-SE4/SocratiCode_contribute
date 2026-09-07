@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { fetch as undiciFetch } from "undici";
 
 /**
  * Support facts this module encodes (each verified by running the client
@@ -13,13 +14,17 @@ import path from "node:path";
  *     renamed the legacy `onError` handler hook, so the v6 Agent fails
  *     validation and every request dies with
  *     `UND_ERR_INVALID_ARG: invalid onError method`.
- *   - 1.19+ bundles undici 7 and works on Node 26+
+ *   - Pairing the client's Agent with fetch from the same undici line avoids
+ *     that cross-version handoff. SocratiCode already depends on undici 6 for
+ *     its Ollama transport, so the same pairing keeps client 1.18 working on
+ *     Node 26 without dropping Node 18 support.
+ *   - 1.19+ bundles undici 7 and works on Node 26 without this bridge
  *     (https://github.com/qdrant/qdrant-js/issues/134, fixed in 1.19).
  *
- * So "does this process break?" is a property of the PAIR (node major,
- * installed client version), not of the Node version alone. The startup
- * guard in index.ts uses these helpers to refuse only the pair that
- * actually breaks.
+ * The bridge below is deliberately narrow: only Qdrant-origin requests that
+ * carry a per-request dispatcher are routed through undici's fetch, and only
+ * for the affected Node/client pair. Every other request keeps using the
+ * process's original fetch implementation.
  */
 
 const QDRANT_CLIENT_PACKAGE = "@qdrant/js-client-rest";
@@ -69,19 +74,84 @@ export function readInstalledQdrantClientVersion(): string | null {
  * dies with an opaque undici error, which is exactly what the guard exists
  * to prevent. On Node < 26 the client version is irrelevant.
  */
-export function qdrantClientBreaksOnThisNode(
+export type QdrantFetchMode = "native" | "paired-undici" | "unknown";
+
+/** Select the fetch transport required by a Node/Qdrant-client pair. */
+export function qdrantFetchMode(
   nodeMajor: number,
   clientVersion: string | null,
-): boolean {
-  if (!Number.isFinite(nodeMajor) || nodeMajor < 26) return false;
-  if (clientVersion === null) return true;
+): QdrantFetchMode {
+  if (!Number.isFinite(nodeMajor) || nodeMajor < 26) return "native";
+  if (clientVersion === null) return "unknown";
   // Full semver shape required (prerelease/build tags allowed): a partial
   // match like `1.19.not-a-version` is NOT a version the registry could
-  // have served, so it fails closed with every other unparseable string
-  // rather than being half-read as a 1.19.
+  // have served, so transport selection fails closed rather than guessing.
   const match = clientVersion.match(/^(\d+)\.(\d+)\.\d+(?:[-+].*)?$/);
-  if (!match) return true;
+  if (!match) return "unknown";
   const major = Number.parseInt(match[1], 10);
   const minor = Number.parseInt(match[2], 10);
-  return major < 1 || (major === 1 && minor < 19);
+  return major < 1 || (major === 1 && minor < 19) ? "paired-undici" : "native";
+}
+
+type FetchFunction = typeof globalThis.fetch;
+type DispatcherRequestInit = RequestInit & { dispatcher?: unknown };
+
+function requestOrigin(input: Parameters<FetchFunction>[0]): string | null {
+  try {
+    if (typeof input === "string") return new URL(input).origin;
+    if (input instanceof URL) return input.origin;
+    return new URL(input.url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a fetch wrapper that pairs Qdrant's undici dispatcher with undici's
+ * own fetch. Errors propagate unchanged; there is no retry or fallback path.
+ */
+export function createQdrantFetchBridge(
+  nativeFetch: FetchFunction,
+  pairedFetch: FetchFunction,
+  qdrantOrigins: ReadonlySet<string>,
+): FetchFunction {
+  return (input, init) => {
+    const origin = requestOrigin(input);
+    const dispatcher = (init as DispatcherRequestInit | undefined)?.dispatcher;
+    if (origin !== null && qdrantOrigins.has(origin) && dispatcher !== undefined) {
+      return pairedFetch(input, init);
+    }
+    return nativeFetch(input, init);
+  };
+}
+
+const bridgedQdrantOrigins = new Set<string>();
+let bridgeInstalled = false;
+
+/**
+ * Install the Node 26/Qdrant 1.18 transport bridge once for the configured
+ * Qdrant origin. Repeated calls only register an additional origin.
+ */
+export function ensureQdrantClientCompatibility(qdrantBaseUrl: string): void {
+  const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
+  const clientVersion = readInstalledQdrantClientVersion();
+  const mode = qdrantFetchMode(nodeMajor, clientVersion);
+  if (mode === "native") return;
+  if (mode === "unknown") {
+    throw new Error(
+      `socraticode: cannot determine the installed @qdrant/js-client-rest version on Node ${process.versions.node}; ` +
+        "cannot select a safe Qdrant transport.",
+    );
+  }
+
+  bridgedQdrantOrigins.add(new URL(qdrantBaseUrl).origin);
+  if (bridgeInstalled) return;
+
+  const nativeFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = createQdrantFetchBridge(
+    nativeFetch,
+    undiciFetch as unknown as FetchFunction,
+    bridgedQdrantOrigins,
+  );
+  bridgeInstalled = true;
 }
