@@ -1056,9 +1056,15 @@ export async function indexProject(
     onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
   }
 
-  // Reaching here means every batch landed in full — a partial upsert throws —
-  // so the walked count is also the indexed count.
-  const filesIndexed = files.length;
+  // filesTotal is everything the walk found; filesIndexed is what the index
+  // actually represents. They differ whenever a file was skipped before
+  // chunking — oversized, or unreadable — so the walked count would overstate
+  // the result. hashes.size is authoritative: oversized paths are excluded from
+  // currentFileSet above and pruned from hashes, and unreadable files never get
+  // an entry. Reaching here means every batch landed in full, since a partial
+  // upsert throws, so no stale entry can inflate it either.
+  const filesTotal = files.length;
+  const filesIndexed = hashes.size;
   const chunksCreated = totalChunksCreated;
 
   // Final metadata save
@@ -1066,8 +1072,8 @@ export async function indexProject(
   await saveProjectMetadata(
     collection,
     resolvedPath,
+    filesTotal,
     filesIndexed,
-    hashes.size,
     hashes,
     "completed",
     effectiveProfile,
