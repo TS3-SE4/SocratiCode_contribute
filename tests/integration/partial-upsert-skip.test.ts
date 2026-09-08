@@ -35,7 +35,17 @@ import {
 import { isDockerAvailable } from "../helpers/fixtures.js";
 import { deleteTestCollection, waitForQdrant } from "../helpers/setup.js";
 
+/**
+ * Locally this skips without Docker. In CI it must not: a test that skips
+ * itself is a silent no-op, and a silent no-op is indistinguishable from a
+ * passing boundary check. REQUIRE_QDRANT=1 therefore turns an unreachable
+ * backend into a failure — the same reason the Rust graph job asserts
+ * `rustc --version` before running its skip-capable test.
+ */
+const requireQdrant = process.env.REQUIRE_QDRANT === "1";
 const dockerAvailable = isDockerAvailable();
+const shouldRun = requireQdrant || dockerAvailable;
+
 const TEST_PROJECT = "/tmp/socraticode-partial-upsert-integration";
 const TEST_COLLECTION = collectionName(projectIdFromPath(TEST_PROJECT));
 
@@ -56,10 +66,21 @@ function pointOfWidth(id: string, relativePath: string, width: number) {
   };
 }
 
-describe.skipIf(!dockerAvailable)("partial Qdrant upsert fails the whole operation", () => {
+describe.skipIf(!shouldRun)("partial Qdrant upsert fails the whole operation", () => {
   beforeAll(async () => {
-    await ensureQdrantReady();
-    await waitForQdrant();
+    if (!requireQdrant) {
+      await ensureQdrantReady();
+    }
+    const ready = await waitForQdrant(60_000);
+    if (!ready) {
+      throw new Error(
+        requireQdrant
+          ? "REQUIRE_QDRANT=1 but Qdrant is not reachable. This regression must fail rather " +
+            "than skip: set QDRANT_MODE/QDRANT_HOST/QDRANT_PORT to a running instance."
+          : "Qdrant did not become ready",
+      );
+    }
+
     await deleteTestCollection(TEST_COLLECTION);
     await ensureCollection(TEST_COLLECTION);
 
