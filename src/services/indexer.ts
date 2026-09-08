@@ -1022,7 +1022,7 @@ export async function indexProject(
       },
     }));
 
-    const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+    const { pointsSkipped, skippedPaths } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
       // Enrich the error with batch context for debugging
       const fileList = fileBatch.map((f) => f.relativePath).join(", ");
       const msg = err instanceof Error ? err.message : String(err);
@@ -1041,11 +1041,30 @@ export async function indexProject(
       );
     }
 
-    // Update hashes for this batch's files
+    // Update hashes for this batch's files.
+    //
+    // A file whose points were only PARTIALLY upserted must keep its old hash.
+    // Re-indexed files have their previous chunks deleted before this loop, so
+    // recording the new hash here would leave the file at zero chunks while
+    // claiming it is current — and every later incremental would skip it,
+    // making the loss permanent and invisible.
+    const skipped = skippedPaths ?? new Set<string>();
+    let chunksLost = 0;
     for (const file of fileBatch) {
+      if (skipped.has(file.relativePath)) {
+        chunksLost += file.chunks.length;
+        continue;
+      }
       hashes.set(file.relativePath, file.contentHash);
     }
-    totalChunksCreated += batchChunkData.length;
+    if (chunksLost > 0) {
+      logger.warn("Files left unindexed after partial upsert; hashes withheld so the next run retries them", {
+        collection,
+        batch: `${batchNum}/${totalBatches}`,
+        files: [...skipped],
+      });
+    }
+    totalChunksCreated += batchChunkData.length - chunksLost;
 
     // Checkpoint: persist hashes after each batch so progress survives crashes
     progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
@@ -1398,7 +1417,7 @@ export async function updateProjectIndex(
         },
       }));
 
-      const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints);
+      const { pointsSkipped, skippedPaths } = await upsertPreEmbeddedChunks(collection, batchPoints);
 
       if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
         throw new Error(
@@ -1407,13 +1426,31 @@ export async function updateProjectIndex(
         );
       }
 
-      // Update hashes and counts for this batch's files
+      // Update hashes and counts for this batch's files.
+      //
+      // See the note in indexProject: a file whose points were only partially
+      // upserted keeps its old hash. Its previous chunks were already deleted,
+      // so recording the new hash would strand it at zero chunks and suppress
+      // every future re-index of it.
+      const skipped = skippedPaths ?? new Set<string>();
+      let chunksLost = 0;
       for (const file of fileBatch) {
+        if (skipped.has(file.relativePath)) {
+          chunksLost += file.chunks.length;
+          continue;
+        }
         hashes.set(file.relativePath, file.contentHash);
         if (file.isNew) added++;
         else updated++;
       }
-      chunksCreated += batchChunkData.length;
+      if (chunksLost > 0) {
+        logger.warn("Files left unindexed after partial upsert; hashes withheld so the next run retries them", {
+          collection,
+          batch: `${batchNum}/${totalBatches}`,
+          files: [...skipped],
+        });
+      }
+      chunksCreated += batchChunkData.length - chunksLost;
 
       // Checkpoint: persist hashes after each batch
       progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
