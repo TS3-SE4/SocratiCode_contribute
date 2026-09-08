@@ -190,4 +190,19 @@ describe("partial upsert skips must not mark a file as indexed", () => {
     // Two files chunked, one never landed in Qdrant.
     expect(result.chunksCreated).toBe(1);
   });
+
+  it("does not report a skipped file as indexed", async () => {
+    const indexer = await loadIndexer();
+    const project = await fsp.mkdtemp(path.join(tempRoot, "project-"));
+    await fsp.writeFile(path.join(project, "kept.ts"), "export const kept = 1;\n");
+    await fsp.writeFile(path.join(project, "lost.ts"), "export const lost = 2;\n");
+
+    failUpsertFor.add("lost.ts");
+
+    const result = await indexer.indexProject(project);
+
+    // Two files were walked, one never landed. Reporting 2 would claim a clean
+    // run and hide the file whose hash was withheld precisely so it is retried.
+    expect(result.filesIndexed).toBe(1);
+  });
 });

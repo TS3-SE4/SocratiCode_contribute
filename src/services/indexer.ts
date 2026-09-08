@@ -1081,7 +1081,12 @@ export async function indexProject(
     onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
   }
 
-  const filesIndexed = files.length;
+  // filesTotal counts everything the walk found; filesIndexed counts only what
+  // actually landed. They diverge when a partial upsert left files unindexed —
+  // reporting files.length as indexed would claim a clean run that did not
+  // happen, and hide the very files the withheld hashes exist to retry.
+  const filesTotal = files.length;
+  const filesIndexed = hashes.size;
   const chunksCreated = totalChunksCreated;
 
   // Final metadata save
@@ -1089,8 +1094,8 @@ export async function indexProject(
   await saveProjectMetadata(
     collection,
     resolvedPath,
+    filesTotal,
     filesIndexed,
-    hashes.size,
     hashes,
     "completed",
     effectiveProfile,
@@ -1127,7 +1132,12 @@ export async function indexProject(
     onProgress?.(`Context artifact indexing failed (non-fatal): ${artifactMsg}`);
   }
 
-  onProgress?.(`Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`);
+  onProgress?.(
+    filesIndexed === filesTotal
+      ? `Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`
+      : `Indexing complete: ${filesIndexed}/${filesTotal} files, ${chunksCreated} chunks ` +
+        `(${filesTotal - filesIndexed} left for retry after partial upsert failures)`,
+  );
   lastCompleted.set(resolvedPath, {
     type: "full-index",
     completedAt: Date.now(),
