@@ -571,14 +571,10 @@ export async function indexArtifact(
     } as Record<string, unknown>,
   }));
 
-  const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, points);
-
-  if (pointsSkipped > 0 && pointsSkipped === points.length) {
-    throw new Error(
-      `Qdrant upsert: all ${points.length} points for artifact "${artifact.name}" ` +
-      `were skipped (collection=${collection}). The collection may have been deleted externally.`
-    );
-  }
+  // Throws if any point failed after the per-point fallback. An artifact whose
+  // chunks only partially landed must not be recorded with a contentHash, or it
+  // will be treated as up-to-date and never re-indexed.
+  await upsertPreEmbeddedChunks(collection, points);
 
   logger.info("Indexed context artifact", {
     name: artifact.name,

@@ -942,11 +942,6 @@ export async function indexProject(
 
   let globalChunksProcessed = 0;
   let totalChunksCreated = 0;
-  // Files left unstored by a partial upsert, accumulated across every batch.
-  // Needed because `hashes` is preloaded from existing metadata: a re-indexed
-  // file that fails to store keeps its OLD hash, so it still occupies an entry
-  // and `hashes.size` alone would count it as indexed.
-  const strandedPaths = new Set<string>();
 
   for (let batchIdx = 0; batchIdx < chunkedFiles.length; batchIdx += INDEX_BATCH_SIZE) {
     // ── Cancellation check: stop gracefully between batches ──
@@ -1027,7 +1022,9 @@ export async function indexProject(
       },
     }));
 
-    const { pointsSkipped, skippedPaths } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+    // Throws if any point failed after the per-point fallback, so hashes below
+    // are only advanced for a batch that landed in full.
+    await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
       // Enrich the error with batch context for debugging
       const fileList = fileBatch.map((f) => f.relativePath).join(", ");
       const msg = err instanceof Error ? err.message : String(err);
@@ -1038,40 +1035,11 @@ export async function indexProject(
       );
     });
 
-    if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-      // Every single point in the batch was skipped — the collection likely disappeared
-      throw new Error(
-        `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-        `were skipped (collection=${collection}). The collection may have been deleted externally.`
-      );
-    }
-
-    // Update hashes for this batch's files.
-    //
-    // A file whose points were only PARTIALLY upserted must keep its old hash.
-    // Re-indexed files have their previous chunks deleted before this loop, so
-    // recording the new hash here would leave the file at zero chunks while
-    // claiming it is current — and every later incremental would skip it,
-    // making the loss permanent and invisible.
-    const skipped = skippedPaths ?? new Set<string>();
-    let chunksLost = 0;
+    // Update hashes for this batch's files
     for (const file of fileBatch) {
-      if (skipped.has(file.relativePath)) {
-        chunksLost += file.chunks.length;
-        strandedPaths.add(file.relativePath);
-        continue;
-      }
       hashes.set(file.relativePath, file.contentHash);
-      strandedPaths.delete(file.relativePath);
     }
-    if (chunksLost > 0) {
-      logger.warn("Files left unindexed after partial upsert; hashes withheld so the next run retries them", {
-        collection,
-        batch: `${batchNum}/${totalBatches}`,
-        files: [...skipped],
-      });
-    }
-    totalChunksCreated += batchChunkData.length - chunksLost;
+    totalChunksCreated += batchChunkData.length;
 
     // Checkpoint: persist hashes after each batch so progress survives crashes
     progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
@@ -1088,17 +1056,9 @@ export async function indexProject(
     onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
   }
 
-  // filesTotal counts everything the walk found; filesIndexed counts only what
-  // actually landed. They diverge when a partial upsert left files unindexed —
-  // reporting files.length as indexed would claim a clean run that did not
-  // happen, and hide the very files the withheld hashes exist to retry.
-  //
-  // hashes.size is not sufficient on its own: it is preloaded from existing
-  // metadata, so a re-indexed file whose upsert was skipped keeps its previous
-  // hash and still occupies an entry. Those have to come back off the count.
-  const filesTotal = files.length;
-  const strandedWithStaleHash = [...strandedPaths].filter((p) => hashes.has(p)).length;
-  const filesIndexed = hashes.size - strandedWithStaleHash;
+  // Reaching here means every batch landed in full — a partial upsert throws —
+  // so the walked count is also the indexed count.
+  const filesIndexed = files.length;
   const chunksCreated = totalChunksCreated;
 
   // Final metadata save
@@ -1106,8 +1066,8 @@ export async function indexProject(
   await saveProjectMetadata(
     collection,
     resolvedPath,
-    filesTotal,
     filesIndexed,
+    hashes.size,
     hashes,
     "completed",
     effectiveProfile,
@@ -1144,12 +1104,7 @@ export async function indexProject(
     onProgress?.(`Context artifact indexing failed (non-fatal): ${artifactMsg}`);
   }
 
-  onProgress?.(
-    filesIndexed === filesTotal
-      ? `Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`
-      : `Indexing complete: ${filesIndexed}/${filesTotal} files, ${chunksCreated} chunks ` +
-        `(${filesTotal - filesIndexed} left for retry after partial upsert failures)`,
-  );
+  onProgress?.(`Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`);
   lastCompleted.set(resolvedPath, {
     type: "full-index",
     completedAt: Date.now(),
@@ -1439,40 +1394,17 @@ export async function updateProjectIndex(
         },
       }));
 
-      const { pointsSkipped, skippedPaths } = await upsertPreEmbeddedChunks(collection, batchPoints);
+      // Throws if any point failed after the per-point fallback, so hashes below
+      // are only advanced for a batch that landed in full.
+      await upsertPreEmbeddedChunks(collection, batchPoints);
 
-      if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-        throw new Error(
-          `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-          `were skipped (collection=${collection}). The collection may have been deleted externally.`
-        );
-      }
-
-      // Update hashes and counts for this batch's files.
-      //
-      // See the note in indexProject: a file whose points were only partially
-      // upserted keeps its old hash. Its previous chunks were already deleted,
-      // so recording the new hash would strand it at zero chunks and suppress
-      // every future re-index of it.
-      const skipped = skippedPaths ?? new Set<string>();
-      let chunksLost = 0;
+      // Update hashes and counts for this batch's files
       for (const file of fileBatch) {
-        if (skipped.has(file.relativePath)) {
-          chunksLost += file.chunks.length;
-          continue;
-        }
         hashes.set(file.relativePath, file.contentHash);
         if (file.isNew) added++;
         else updated++;
       }
-      if (chunksLost > 0) {
-        logger.warn("Files left unindexed after partial upsert; hashes withheld so the next run retries them", {
-          collection,
-          batch: `${batchNum}/${totalBatches}`,
-          files: [...skipped],
-        });
-      }
-      chunksCreated += batchChunkData.length - chunksLost;
+      chunksCreated += batchChunkData.length;
 
       // Checkpoint: persist hashes after each batch
       progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;

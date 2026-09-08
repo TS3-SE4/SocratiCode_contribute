@@ -356,13 +356,15 @@ const MAX_BM25_TEXT_CHARS = 32_000; // ~32KB
 /** Upsert pre-embedded points into a collection (no embedding generation).
  * bm25Text is forwarded to Qdrant's server-side BM25 inference (truncated if too long).
  *
- * Returns the number of points skipped due to upsert errors, and the
- * `relativePath` of every file those points belonged to.
+ * A failing batch is retried point by point to isolate the bad point(s). If any
+ * point still fails, this throws: a partial write must fail the whole indexing
+ * operation.
  *
- * Callers MUST NOT record a file as indexed when its path is in `skippedPaths`.
- * A re-indexed file has its previous chunks deleted before this call, so
- * marking it current after a partial skip strands it at zero chunks with a
- * content hash that suppresses every future re-index. */
+ * Callers must not treat a partial write as success. A re-indexed file has its
+ * previous chunks deleted before this call, so recording it as indexed after a
+ * partial failure strands it at zero chunks with a content hash that suppresses
+ * every future re-index. Throwing leaves stored hashes and earlier checkpoints
+ * untouched, so the next index or update retries the file naturally. */
 export async function upsertPreEmbeddedChunks(
   collectionName: string,
   points: Array<{
@@ -371,8 +373,8 @@ export async function upsertPreEmbeddedChunks(
     bm25Text: string;
     payload: Record<string, unknown>;
   }>,
-): Promise<{ pointsSkipped: number; skippedPaths: Set<string> }> {
-  if (points.length === 0) return { pointsSkipped: 0, skippedPaths: new Set<string>() };
+): Promise<void> {
+  if (points.length === 0) return;
 
   const qdrant = getClient();
   const namedPoints = points.map((p) => ({
@@ -433,7 +435,17 @@ export async function upsertPreEmbeddedChunks(
     }
   }
 
-  return { pointsSkipped: totalSkipped, skippedPaths };
+  if (totalSkipped > 0) {
+    const affected = [...skippedPaths].sort();
+    const shown = affected.slice(0, 10).join(", ");
+    const more = affected.length > 10 ? `, and ${affected.length - 10} more` : "";
+    throw new Error(
+      `Qdrant upsert incomplete for collection=${collectionName}: ` +
+      `${totalSkipped}/${points.length} point(s) failed after per-point retry. ` +
+      `Affected files: ${shown}${more}. ` +
+      `Nothing has been recorded as indexed; re-run the index once Qdrant is healthy.`,
+    );
+  }
 }
 
 /** Delete all chunks for a specific file (matched by relativePath) */
