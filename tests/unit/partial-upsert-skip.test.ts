@@ -205,4 +205,30 @@ describe("partial upsert skips must not mark a file as indexed", () => {
     // run and hide the file whose hash was withheld precisely so it is retried.
     expect(result.filesIndexed).toBe(1);
   });
+
+  it("does not report a skipped file as indexed when it already had a stored hash", async () => {
+    const indexer = await loadIndexer();
+    const project = await fsp.mkdtemp(path.join(tempRoot, "project-"));
+    const keptContent = "export const kept = 1;\n";
+    await fsp.writeFile(path.join(project, "kept.ts"), keptContent);
+    await fsp.writeFile(path.join(project, "lost.ts"), "export const lost = 2;\n");
+
+    // Both files are already indexed and both have since been edited, so both
+    // are re-chunked into the same batch — which is what makes the skip below
+    // partial rather than total. lost.ts keeps a STALE hash after the withhold,
+    // so hashes.size alone would still count it and report a clean 2/2.
+    collectionInfo = { pointsCount: 2, status: "green" };
+    storedHashes = new Map([
+      ["kept.ts", indexer.hashContent("export const kept = 0;\n")],
+      ["lost.ts", indexer.hashContent("export const lost = 1;\n")],
+    ]);
+
+    failUpsertFor.add("lost.ts");
+
+    const result = await indexer.indexProject(project);
+
+    expect(result.filesIndexed).toBe(1);
+    // The stale hash must remain, so the next run retries the file.
+    expect(storedHashes?.get("lost.ts")).toBe(indexer.hashContent("export const lost = 1;\n"));
+  });
 });

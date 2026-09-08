@@ -942,6 +942,11 @@ export async function indexProject(
 
   let globalChunksProcessed = 0;
   let totalChunksCreated = 0;
+  // Files left unstored by a partial upsert, accumulated across every batch.
+  // Needed because `hashes` is preloaded from existing metadata: a re-indexed
+  // file that fails to store keeps its OLD hash, so it still occupies an entry
+  // and `hashes.size` alone would count it as indexed.
+  const strandedPaths = new Set<string>();
 
   for (let batchIdx = 0; batchIdx < chunkedFiles.length; batchIdx += INDEX_BATCH_SIZE) {
     // ── Cancellation check: stop gracefully between batches ──
@@ -1053,9 +1058,11 @@ export async function indexProject(
     for (const file of fileBatch) {
       if (skipped.has(file.relativePath)) {
         chunksLost += file.chunks.length;
+        strandedPaths.add(file.relativePath);
         continue;
       }
       hashes.set(file.relativePath, file.contentHash);
+      strandedPaths.delete(file.relativePath);
     }
     if (chunksLost > 0) {
       logger.warn("Files left unindexed after partial upsert; hashes withheld so the next run retries them", {
@@ -1085,8 +1092,13 @@ export async function indexProject(
   // actually landed. They diverge when a partial upsert left files unindexed —
   // reporting files.length as indexed would claim a clean run that did not
   // happen, and hide the very files the withheld hashes exist to retry.
+  //
+  // hashes.size is not sufficient on its own: it is preloaded from existing
+  // metadata, so a re-indexed file whose upsert was skipped keeps its previous
+  // hash and still occupies an entry. Those have to come back off the count.
   const filesTotal = files.length;
-  const filesIndexed = hashes.size;
+  const strandedWithStaleHash = [...strandedPaths].filter((p) => hashes.has(p)).length;
+  const filesIndexed = hashes.size - strandedWithStaleHash;
   const chunksCreated = totalChunksCreated;
 
   // Final metadata save
