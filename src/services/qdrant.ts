@@ -279,19 +279,34 @@ export async function listCodebaseCollections(): Promise<string[]> {
   // Listing is read-only: an absent metadata collection means there are no metadata-only entries yet.
   if (collections.collections.some((collection) => collection.name === METADATA_COLLECTION)) {
     try {
-      const metaPoints = await qdrant.scroll(METADATA_COLLECTION, {
-        limit: 100,
-        with_payload: true,
-      });
-      for (const point of metaPoints.points) {
-        const collName = point.payload?.collectionName as string | undefined;
-        if (
-          (collName?.startsWith(`${p}codegraph_`) || collName?.startsWith(`${p}context_`)) &&
-          !result.includes(collName)
-        ) {
-          result.push(collName);
+      // Only `collectionName` is read below, but a metadata point also carries
+      // the project's entire path-to-hash map, so `with_payload: true` fetched
+      // every hash map on the instance to look at one string per point.
+      // Measured against a 29-project instance: 13.7 MB transferred for 3 KB of
+      // payload actually used. This runs on every auto-resume and every listing.
+      //
+      // The single `limit: 100` request also silently dropped everything past
+      // the hundredth point, and this list is what the manage tools report, so
+      // page it the way `listIndexedFilePaths` does.
+      let offset: string | number | Record<string, unknown> | undefined | null;
+      do {
+        const metaPoints = await qdrant.scroll(METADATA_COLLECTION, {
+          limit: 100,
+          with_payload: { include: ["collectionName"] },
+          with_vector: false,
+          ...(offset === undefined || offset === null ? {} : { offset }),
+        });
+        for (const point of metaPoints.points) {
+          const collName = point.payload?.collectionName as string | undefined;
+          if (
+            (collName?.startsWith(`${p}codegraph_`) || collName?.startsWith(`${p}context_`)) &&
+            !result.includes(collName)
+          ) {
+            result.push(collName);
+          }
         }
-      }
+        offset = metaPoints.next_page_offset;
+      } while (offset !== undefined && offset !== null);
     } catch (err) {
       logger.info("listCodebaseCollections: metadata scroll failed", {
         error: err instanceof Error ? err.message : String(err),
