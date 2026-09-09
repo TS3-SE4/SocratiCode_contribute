@@ -97,15 +97,20 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-      # The partial-upsert regression needs a real Qdrant, so it lives under
-      # tests/integration/ and the unit matrix never reaches it. Run it here,
+      # These regressions need a real Qdrant, so they live under
+      # tests/integration/ and the unit matrix never reaches them. Run them here,
       # against this job's service container.
+      #
+      # Name each file rather than the directory: the rest of tests/integration/
+      # needs an embedding service this job does not have. Both files below stub
+      # embedding readiness and generation only — Qdrant and the indexing and
+      # recovery paths stay real.
       #
       # REQUIRE_QDRANT=1 makes an unreachable backend fail the job rather than
       # letting describe.skipIf report a skipped success — the same reasoning as
       # the rust job's `rustc --version` step below. QDRANT_URL drives the
       # client; QDRANT_HOST/PORT are what the test helpers read, so both are set.
-      - name: Partial-upsert regression against Qdrant
+      - name: Qdrant-backed regressions
         shell: bash
         run: |
           set -euo pipefail
@@ -123,7 +128,9 @@ jobs:
           QDRANT_URL=http://127.0.0.1:6333 \
           QDRANT_HOST=127.0.0.1 \
           QDRANT_PORT=6333 \
-            npx vitest run tests/integration/partial-upsert-skip.test.ts
+            npx vitest run \
+              tests/integration/partial-upsert-skip.test.ts \
+              tests/integration/interrupted-resume-recovery.test.ts
 
       - name: Verify the unmodified package against Qdrant on Node 26
         shell: bash

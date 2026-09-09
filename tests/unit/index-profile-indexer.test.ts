@@ -76,6 +76,11 @@ vi.mock("../../src/services/qdrant.js", () => ({
   }),
   getCollectionInfo: vi.fn(async () => collectionInfo),
   getProjectMetadata: vi.fn(async () => null),
+  // These fixtures record no metadata, so there is no persisted status either.
+  // Returning null leaves the reconciliation gate closed, which is what these
+  // tests assume: they exercise profile compatibility, not interrupted recovery.
+  loadIndexingStatus: vi.fn(async () => null),
+  listIndexedFilePaths: vi.fn(async () => new Set<string>()),
   loadProjectEffectiveProfile: vi.fn(async () => storedProfile),
   loadProjectHashes: vi.fn(async () =>
     storedHashes === null ? null : new Map(storedHashes),
