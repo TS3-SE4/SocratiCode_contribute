@@ -73,6 +73,13 @@ const shouldRun = requireQdrant || isDockerAvailable();
 const originalEnv = { ...process.env };
 let root = "";
 
+async function exists(p: string): Promise<boolean> {
+  return fsp.access(p).then(
+    () => true,
+    () => false,
+  );
+}
+
 async function writeFiles(dir: string, files: Record<string, string>): Promise<void> {
   for (const [rel, body] of Object.entries(files)) {
     const abs = path.join(dir, rel);
@@ -175,9 +182,15 @@ describe.skipIf(!shouldRun)("recovery from an interrupted update", () => {
 
   it("recovers from the original checkout when two worktrees share a project id", async () => {
     // The originally reported shape. A pinned projectId makes both checkouts
-    // resolve to one collection, so indexing from the second can remove content
-    // belonging to the first; interrupt that and the first checkout could never
-    // restore it. Pinned here so the outcome is reproduced rather than implied.
+    // resolve to one collection, so a run from the linked checkout — where the
+    // file genuinely does not exist — removes content belonging to the main
+    // one; interrupt that and the main checkout could never restore it.
+    //
+    // The linked checkout has to materially participate or this collapses into
+    // the synthetic case above with unused setup: the differing source tree and
+    // the persisted project path both come from `linked`, and only the removal
+    // of the points is simulated, because the interruption window itself cannot
+    // be hit deterministically.
     const main = path.join(root, "shared");
     await fsp.mkdir(main, { recursive: true });
     execFileSync("git", ["init", "-b", "main", main], { stdio: ["pipe", "pipe", "pipe"] });
@@ -191,21 +204,32 @@ describe.skipIf(!shouldRun)("recovery from an interrupted update", () => {
     execFileSync("git", ["add", "-A"], { cwd: main });
     execFileSync("git", ["commit", "-m", "init"], { cwd: main });
 
+    // A branch that does not carry the file. This is what makes an index run
+    // from the linked checkout delete its chunks in the first place.
     const linked = path.join(root, "shared-worktree");
     execFileSync("git", ["worktree", "add", "-b", "feature", linked], { cwd: main });
+    execFileSync("git", ["rm", "-q", "only-in-main.ts"], { cwd: linked });
+    execFileSync("git", ["commit", "-m", "drop only-in-main"], { cwd: linked });
 
     try {
+      // Without a shared id the two checkouts never touch one collection and
+      // none of what follows is about worktrees.
+      expect(projectIdFromPath(linked)).toBe(projectIdFromPath(main));
+      expect(await exists(path.join(main, "only-in-main.ts"))).toBe(true);
+      expect(await exists(path.join(linked, "only-in-main.ts"))).toBe(false);
+
       await indexProject(main);
       const collection = collectionName(projectIdFromPath(path.resolve(main)));
       const pointsWhenHealthy = (await getCollectionInfo(collection))?.pointsCount ?? 0;
       expect((await listIndexedFilePaths(collection)).has("only-in-main.ts")).toBe(true);
 
-      // The second checkout's run removes the file's chunks and is interrupted
-      // before the pruned hashes are written — the state that made this
-      // unrecoverable from the main checkout.
-      await simulateInterruptedRemoval(collection, path.resolve(main), "only-in-main.ts");
+      // The linked checkout's update: the file is absent there, so its chunks
+      // go — and the pruned hashes are never written, because it is
+      // interrupted. The project path recorded in metadata is the linked one.
+      await simulateInterruptedRemoval(collection, path.resolve(linked), "only-in-main.ts");
 
-      await updateProjectIndex(main);
+      // Startup's entry point, from the checkout that still has the file.
+      await indexProject(main);
 
       const recovered = await listIndexedFilePaths(collection);
       expect(recovered.has("only-in-main.ts")).toBe(true);
