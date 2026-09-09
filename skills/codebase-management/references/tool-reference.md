@@ -251,5 +251,5 @@ List all projects that have been indexed.
 ### Chunking defaults
 - Chunk size: 100 lines, 10 lines overlap
 - Batch size: 50 files per batch (for resumable checkpointing)
-- Max chunk chars: 2000 (configurable via `MAX_CHUNK_CHARS`; truncates the chunk on the small-file, AST and line-based paths, and is the split boundary on the minified/bundled path)
+- Max chunk chars: 2000 (configurable via `MAX_CHUNK_CHARS`; the split boundary on every path — a chunk over the cap becomes several roughly equal chunks, and nothing is dropped except a piece holding only whitespace)
 - Max file size: 5 MB (configurable via `MAX_FILE_SIZE_MB`; must be a complete finite number)

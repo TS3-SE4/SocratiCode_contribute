@@ -247,7 +247,7 @@ All constants are defined in `src/constants.ts`:
 | `CHUNK_OVERLAP` | `10` | Overlapping lines between chunks cut by line count — adjacent AST declaration chunks do not overlap |
 | `MAX_FILE_BYTES` | `5 MB` | Max file size before skipping (env-configurable via `MAX_FILE_SIZE_MB`) |
 | `MAX_AVG_LINE_LENGTH` | `500` | Avg line length above which character-based chunking is used (minified files) |
-| `MAX_CHUNK_CHARS` | `2000` | Hard character limit per chunk (provider-level safety net, env-configurable via `MAX_CHUNK_CHARS`) |
+| `MAX_CHUNK_CHARS` | `2000` | Character limit per chunk, and the boundary an over-long chunk is split at (env-configurable via `MAX_CHUNK_CHARS`) |
 | `QDRANT_PORT` | `16333` | Qdrant HTTP API port (host-side) |
 | `QDRANT_GRPC_PORT` | `16334` | Qdrant gRPC port (host-side) |
 | `QDRANT_CONTAINER_NAME` | `socraticode-qdrant` | Docker container name |
@@ -385,8 +385,8 @@ When `codebase_index` is called:
    │   │   ├── Small declarations merged, large ones sub-chunked
    │   │   └── Preamble (imports) and epilogue handled separately
    │   └── Line-based fallback: 100-line segments with 10-line overlap
-   ├── Hard character cap (`MAX_CHUNK_CHARS`, default 2000 chars) applied to all chunks
-   ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
+   ├── Character cap (`MAX_CHUNK_CHARS`, default 2000 chars): a chunk over the cap is split into roughly equal pieces, not truncated
+   ├── Generate chunk ID: SHA-256 of "relativePath:startLine" as UUID (the minified path seeds it with the byte offset instead, since a one-line file has only one startLine); the continuation pieces of a split chunk derive theirs from the parent's id
    └── Detect language from file extension
 
 6. BATCHED EMBEDDING + UPSERT (50 files per batch)
@@ -828,9 +828,9 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | `getPersistedIndexingStatus` | `(projectPath) → Promise<"completed" \| "in-progress" \| "unknown">` | Check persisted indexing status in Qdrant metadata |
 | `requestCancellation` | `(projectPath) → boolean` | Request graceful cancellation (stops after current batch) |
 | `hashContent` | `(content) → string` | SHA-256 hash (16-char hex prefix) for change detection |
-| `chunkId` | `(filePath, startLine) → string` | Generate a stable UUID chunk ID from file path and line number |
+| `chunkId` | `(relativePath, startLine) → string` | Generate a stable UUID chunk ID from the repository-relative path and a position in the file. The minified path passes a byte offset in place of the line number |
 | `isIndexableFile` | `(fileName, extraExts?) → boolean` | Check if a file should be indexed based on extension or name |
-| `chunkFileContent` | `(filePath, relativePath, content) → FileChunk[]` | AST-aware chunking with line-based and character-based fallbacks |
+| `chunkFileContent` | `(filePath, relativePath, content, options?) → FileChunk[]` | AST-aware chunking with line-based and character-based fallbacks. `options` overrides the character cap and the extension-to-language map |
 | `getIndexableFiles` | `(projectPath, extraExts?) → Promise<string[]>` | Discover files respecting ignore rules + extra extensions |
 | `indexProject` | `(projectPath, onProgress?, extraExtensions?) → Promise<{ filesIndexed, chunksCreated, cancelled }>` | Full index with batched/resumable pipeline |
 | `updateProjectIndex` | `(projectPath, onProgress?, extraExtensions?) → Promise<{ added, updated, removed, chunksCreated, cancelled }>` | Incremental update |
@@ -1362,7 +1362,7 @@ Behaviour:
 
 ```typescript
 interface FileChunk {
-  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12)
+  id: string;            // SHA-256 of "relativePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12)
   filePath: string;      // Absolute path
   relativePath: string;  // Relative to project root
   content: string;       // Chunk text content
