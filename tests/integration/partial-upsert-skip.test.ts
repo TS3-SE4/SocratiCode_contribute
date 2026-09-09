@@ -26,7 +26,6 @@ import { collectionName, projectIdFromPath } from "../../src/config.js";
 import { ensureQdrantReady } from "../../src/services/docker.js";
 import { requestedIndexProfile } from "../../src/services/index-profile.js";
 import {
-  deleteCollection,
   ensureCollection,
   getCollectionInfo,
   loadProjectHashes,
@@ -34,6 +33,7 @@ import {
   upsertPreEmbeddedChunks,
 } from "../../src/services/qdrant.js";
 import { isDockerAvailable } from "../helpers/fixtures.js";
+import { deleteTestCollection, waitForQdrant } from "../helpers/setup.js";
 
 /**
  * Locally this skips without Docker. In CI it must not: a test that skips
@@ -72,23 +72,21 @@ describe.skipIf(!shouldRun)("partial Qdrant upsert fails the whole operation", (
       await ensureQdrantReady();
     }
 
-    // Reach Qdrant through the service's own client rather than the raw one in
-    // tests/helpers: getClient() applies ensureQdrantClientCompatibility(),
-    // which is what makes the client usable on Node 26. A bare QdrantClient
-    // fails there with "Failed to obtain server version", which would look like
-    // an unreachable server even while Qdrant is healthy.
-    try {
-      await deleteCollection(TEST_COLLECTION).catch(() => undefined);
-      await ensureCollection(TEST_COLLECTION);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+    // Uses the shared helpers deliberately: they now route through the
+    // service's getClient(), so running here is what proves that path works on
+    // Node 26. Reaching around them would leave the helper fix uncovered.
+    const ready = await waitForQdrant(60_000);
+    if (!ready) {
       throw new Error(
         requireQdrant
-          ? "REQUIRE_QDRANT=1 but Qdrant is not usable. This regression must fail rather than " +
-            `skip: point QDRANT_MODE/QDRANT_URL at a running instance. Underlying error: ${detail}`
-          : `Qdrant did not become ready: ${detail}`,
+          ? "REQUIRE_QDRANT=1 but Qdrant is not reachable. This regression must fail rather " +
+            "than skip: point QDRANT_MODE/QDRANT_URL at a running instance."
+          : "Qdrant did not become ready",
       );
     }
+
+    await deleteTestCollection(TEST_COLLECTION);
+    await ensureCollection(TEST_COLLECTION);
 
     const info = await getCollectionInfo(TEST_COLLECTION);
     if (!info?.denseVectorSize) {
@@ -98,7 +96,7 @@ describe.skipIf(!shouldRun)("partial Qdrant upsert fails the whole operation", (
   }, 180_000);
 
   afterAll(async () => {
-    await deleteCollection(TEST_COLLECTION).catch(() => undefined);
+    await deleteTestCollection(TEST_COLLECTION);
   });
 
   it("stores the valid point, then throws naming the invalid one", async () => {
