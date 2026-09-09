@@ -2648,68 +2648,26 @@ export function resolveImport(
       // root both offer the module, the sibling is what actually gets
       // imported.
       //
-      // Only for a directory that is not itself a regular package (#157). A
-      // directory holding `__init__.py` is imported as a package, and every
-      // documented way of importing one — installed distribution, `-m`, a
-      // path entry above it — resolves `import requests` from
-      // `src/pkg/client.py` through `sys.path` to the installed distribution,
-      // so a sibling `src/pkg/requests.py` is not what runs. Without this gate
-      // any first-party module sharing a name with a dependency invents an
-      // edge — the graph-wide version of the self-edge the guard above
-      // removes.
+      // A NON-SELF collision here is left alone, deliberately (#157). Where a
+      // first-party module shares a name with a third-party distribution —
+      // `src/pkg/requests.py` beside `src/pkg/client.py` doing `import
+      // requests` — which one CPython loads depends on how the file is run,
+      // and the tree does not say. Imported as `pkg.client`, `sys.path` finds
+      // the installed distribution; executed as `python src/pkg/client.py`,
+      // `sys.path[0]` is `src/pkg` and the sibling wins. An `__init__.py` does
+      // not settle it: `sys.path[0]` is the SCRIPT's directory whether or not
+      // the directory is also a package, so gating on one would drop the
+      // legitimate #46 edge from a directly executed service directory that
+      // happens to contain `__init__.py`. The same ambiguity covers PEP 420
+      // namespace packages, which have no `__init__.py` to test at all.
       //
-      // The gate is a trade, not a law: `sys.path[0]` is the *script's*
-      // directory whether or not it holds `__init__.py`, so `python
-      // service-a/main.py` really does import a sibling `service-a/config.py`
-      // even when `service-a/__init__.py` exists, and that edge is dropped
-      // here. A name collision with a dependency is unfalsifiable from the
-      // tree, while a package directory at least says the file is normally
-      // reached as `pkg.client`; the false edge is judged the costlier of the
-      // two. The #46 layout the fallback serves — a runnable directory with no
-      // `__init__.py` — is unaffected.
-      //
-      // Deliberately NOT extended to PEP 420 namespace packages, which have
-      // no `__init__.py` to test: `src/ns/sub/mod.py` importing `requests`
-      // beside `src/ns/sub/requests.py` still resolves to the sibling. The
-      // structural discriminator that would catch it — "sourceDir sits below
-      // a declared import root" — is unusable, because it also fires on
-      // `packages/pkg-a/src/pkg_a/main.py`, whose roots include
-      // `packages/pkg-a/src`, and would invert "prefers the sibling-flat
-      // guess over a manifest root" below. A directory with neither
-      // `__init__.py` nor a manifest of its own is genuinely indistinguishable
-      // from the runnable script directory #46 exists to serve, so the
-      // ambiguity is left as it is rather than guessed at. The self-edge
-      // inside such a package is still removed, by the guard above.
-      // Any ancestor up to the project root, not just `sourceDir` itself: a
-      // directory below a regular package is part of that package's tree even
-      // when it carries no `__init__.py` of its own. `src/pkg/vendor/mod.py`
-      // under `src/pkg/__init__.py` is reached as `pkg.vendor.mod` — verified
-      // against CPython, where `import requests` there loads the installed
-      // distribution and not the sibling `vendor/requests.py`. Checking only
-      // `sourceDir` gated `src/pkg/client.py` while leaving its own
-      // subdirectory fabricating the same edge.
-      //
-      // The project root itself counts. Indexing a directory that IS a package
-      // (`.../src/mylib`, `__init__.py` and all) disables the sibling fallback
-      // for the whole tree, and that is right rather than merely intended:
-      // every file in it is a `mylib.*` module reached through the parent
-      // directory on `sys.path`, so the flat guess was never what CPython does
-      // there.
-      let inPackage = false;
-      for (
-        let dir = toForwardSlash(path.relative(projectPath, sourceDir));
-        ;
-        dir = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : ""
-      ) {
-        if (fileSet.has(dir === "" ? "__init__.py" : `${dir}/__init__.py`)) {
-          inPackage = true;
-          break;
-        }
-        if (dir === "") break;
-      }
-      const sibling = inPackage
-        ? null
-        : notSelf(resolveRelativePath(modulePath, sourceDir, projectPath, fileSet, [".py"]));
+      // So the sibling stands in every non-self case, and only the
+      // unambiguous self-resolution above is removed. Narrowing this needs
+      // evidence of execution mode that the resolver does not currently have —
+      // not an inference from layout.
+      const sibling = notSelf(
+        resolveRelativePath(modulePath, sourceDir, projectPath, fileSet, [".py"]),
+      );
       if (sibling) return sibling;
 
       // Manifest-declared import roots (issue #107), nearest first. The probes

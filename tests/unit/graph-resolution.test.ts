@@ -510,24 +510,6 @@ describe("graph-resolution", () => {
       ).toBeNull();
     });
 
-    it("holds that principle when a first-party sibling shares the module name", () => {
-      // The assertion above passes partly because nothing in the fixture is
-      // called `requests`. Add one and the sibling probe reached past the
-      // declared roots and answered with it, turning "absent from every
-      // declared root" into a fabricated first-party edge (#157). The
-      // importing directory is a package, so the sibling is not on sys.path
-      // for this file and the third-party import stays unresolved.
-      project = createTempProject({
-        ...workspace,
-        "packages/adapter-sos/src/adapter_sos/__init__.py": "",
-        "packages/adapter-sos/src/adapter_sos/requests/adapters.py": "",
-      });
-
-      expect(
-        pyResolve("requests.adapters", "packages/adapter-sos/src/adapter_sos/db.py", project),
-      ).toBeNull();
-    });
-
     it("returns null for a src-layout import when no roots are passed", () => {
       // Back-compat pin: every pre-#107 caller omits the list, and that
       // omission must reproduce the old behavior exactly rather than
@@ -678,35 +660,6 @@ describe("graph-resolution", () => {
   });
 
   describe("sibling-flat fallback scope (#157)", () => {
-    it("does not guess a package's import into a same-named sibling", () => {
-      // `src/pkg` holds __init__.py, so it is a regular package and is never
-      // sys.path[0]. CPython resolves `import requests` through sys.path to
-      // the installed distribution; the sibling file is not what runs.
-      project = createTempProject({
-        "src/pkg/__init__.py": "",
-        "src/pkg/client.py": "",
-        "src/pkg/requests.py": "",
-      });
-
-      expect(pyResolve("requests", "src/pkg/client.py", project)).toBeNull();
-    });
-
-    it("gates a namespace subdirectory inside a regular package", () => {
-      // `src/pkg/vendor` carries no __init__.py of its own, but it sits under
-      // one, so it is a portion of the `pkg` tree and mod.py is reached as
-      // `pkg.vendor.mod`. Verified against CPython: `import requests` there
-      // loads the installed distribution, not the sibling. Gating only on
-      // sourceDir's own __init__.py caught src/pkg/client.py and missed this,
-      // which is the same fabricated edge one directory deeper.
-      project = createTempProject({
-        "src/pkg/__init__.py": "",
-        "src/pkg/vendor/mod.py": "",
-        "src/pkg/vendor/requests.py": "",
-      });
-
-      expect(pyResolve("requests", "src/pkg/vendor/mod.py", project)).toBeNull();
-    });
-
     it("does not resolve a file to itself", () => {
       // The first-party module named after the package it wraps. No Python
       // import produces a dependency on the importing file.
@@ -750,14 +703,13 @@ describe("graph-resolution", () => {
       expect(pyResolve("requests", "service-a/requests.py", project)).toBeNull();
     });
 
-    it("leaves the PEP 420 namespace-package collision resolved, by choice", () => {
-      // Pinned as a decision, not an oversight. `src/ns/sub` has no
-      // __init__.py, so the package gate cannot see it, and the alternative
-      // discriminator — "sourceDir sits below a declared import root" — also
-      // fires on packages/pkg-a/src/pkg_a and would invert "prefers the
-      // sibling-flat guess over a manifest root" above. Such a directory is
-      // indistinguishable from the runnable script directory #46 serves, so
-      // the sibling stands. Only the self-edge is removed.
+    it("leaves a non-self collision resolved — execution-mode ambiguity", () => {
+      // Which file CPython loads for `import requests` here depends on how
+      // mod.py is run, and the tree does not say: imported as `ns.sub.mod` the
+      // installed distribution wins, executed as `python src/ns/sub/mod.py`
+      // the sibling does. Pinned as a decision rather than an oversight — the
+      // resolver has no evidence of execution mode, so it does not guess.
+      // Only the unambiguous self-resolution is removed.
       project = createTempProject({
         "pyproject.toml": '[project]\nname = "ns-demo"\n',
         "src/ns/sub/mod.py": "",
@@ -766,6 +718,41 @@ describe("graph-resolution", () => {
 
       expect(pyResolve("requests", "src/ns/sub/mod.py", project)).toBe("src/ns/sub/requests.py");
       expect(pyResolve("requests", "src/ns/sub/requests.py", project)).toBeNull();
+    });
+
+    it("keeps the #46 sibling edge when the service directory also has __init__.py", () => {
+      // `sys.path[0]` is the SCRIPT's directory whether or not that directory
+      // is also a package, so `python service-a/main.py` really does import
+      // service-a/config.py here. Gating the sibling probe on __init__.py
+      // would drop this legitimate #46 edge on a layout the tree cannot
+      // distinguish from a package module — a backward-compatibility
+      // regression, so it is not done.
+      project = createTempProject({
+        "service-a/__init__.py": "",
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBe("service-a/config.py");
+    });
+
+    it("leaves a regular-package name collision resolved — execution-mode ambiguity", () => {
+      // The #157 report's own case, left alone on purpose. `import requests`
+      // from src/pkg/client.py loads the installed distribution when the file
+      // is reached as `pkg.client`, and the sibling when it is executed
+      // directly; __init__.py does not settle which, because sys.path[0]
+      // follows the invocation, not the layout. Documented rather than
+      // changed. Narrowing it needs evidence of execution mode the resolver
+      // does not have.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/client.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/client.py", project)).toBe("src/pkg/requests.py");
+      // The self-edge in the same tree is still unambiguous, and still goes.
+      expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
     });
 
     it("does not fall through a project-root self match into src/", () => {
@@ -783,29 +770,6 @@ describe("graph-resolution", () => {
       // The src-layout file still reaches the root module; only the self
       // match is discarded.
       expect(pyResolve("mod", "src/mod.py", project)).toBe("mod.py");
-    });
-
-    it("drops a script-run package directory's sibling edge, as an accepted cost", () => {
-      // Pinned because it is a real loss, not a neutral refinement. `sys.path[0]`
-      // is the SCRIPT's directory whether or not it holds `__init__.py`, so
-      // `python service-a/main.py` genuinely imports `service-a/config.py`
-      // here and this edge is now missed — the same layout as the #46 test
-      // above, one `__init__.py` away.
-      //
-      // Accepted because the two errors are not symmetric. A name collision
-      // with a dependency cannot be falsified from the tree, so leaving the
-      // gate off invents edges wherever one occurs; a package directory at
-      // least says the file is normally reached as `pkg.client`, and running a
-      // script from inside a package is the layout Python itself discourages
-      // (relative imports fail there). If this proves wrong in the wild, the
-      // fix is a discriminator for "run as a script", not removing the gate.
-      project = createTempProject({
-        "service-a/__init__.py": "",
-        "service-a/main.py": "",
-        "service-a/config.py": "",
-      });
-
-      expect(pyResolve("config", "service-a/main.py", project)).toBeNull();
     });
 
     it("does not fall through a src/ self match into lib/", () => {
