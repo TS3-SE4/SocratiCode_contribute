@@ -1159,6 +1159,35 @@ export async function getProjectMetadata(collName: string): Promise<ProjectMetad
   }
 }
 
+/**
+ * Persisted indexing status, without the best-effort swallowing.
+ *
+ * `getProjectMetadata()` is display-oriented: it catches every read error and
+ * answers `null`, which is right for showing a status line and wrong for
+ * deciding one. A caller that asks "was the last run interrupted?" and takes
+ * `null` for "no" will, on a transient metadata read failure, skip the recovery
+ * that failure should have triggered — and then persist the still-damaged index
+ * as `completed`, which is worse than not having run at all.
+ *
+ * Returns `null` only when there is genuinely no metadata for the collection.
+ * Transport, parsing and validation failures propagate, so the caller aborts
+ * rather than guessing.
+ */
+export async function loadIndexingStatus(collName: string): Promise<IndexingStatus | null> {
+  const payload = await loadMetadataPayloadReadOnly(collName);
+  if (payload === null) return null;
+
+  const status = payload.indexingStatus;
+  // Absent on records written before the field existed; those were complete.
+  if (status === undefined || status === null) return "completed";
+  if (status === "in-progress" || status === "completed") return status;
+
+  throw new Error(
+    `Unrecognised indexingStatus ${JSON.stringify(status)} in metadata for ${collName}. ` +
+      "Refusing to guess whether the last run completed.",
+  );
+}
+
 /** Delete project metadata.
  * Errors are logged but not propagated (best-effort deletion). */
 export async function deleteProjectMetadata(collName: string): Promise<void> {

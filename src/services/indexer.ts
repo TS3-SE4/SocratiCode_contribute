@@ -45,6 +45,7 @@ import {
   getCollectionInfo,
   getProjectMetadata,
   listIndexedFilePaths,
+  loadIndexingStatus,
   loadProjectEffectiveProfile,
   loadProjectHashes,
   saveProjectMetadata,
@@ -858,8 +859,13 @@ export async function indexProject(
   // reconciliation scroll. See reconcileHashesWithStoredPoints for why this is
   // scoped rather than run on every index.
   if (hasExistingData) {
-    const persisted = await getProjectMetadata(collection);
-    if (persisted?.indexingStatus === "in-progress") {
+    // Strict read on purpose: getProjectMetadata() answers null for any failure,
+    // so using it here would turn a transient metadata error into "not
+    // interrupted", skip the recovery that error should have triggered, and let
+    // the run persist a still-damaged index as completed. A failed read must
+    // abort instead.
+    const persisted = await loadIndexingStatus(collection);
+    if (persisted === "in-progress") {
       await reconcileHashesWithStoredPoints(collection, hashes, projectId);
     }
   }
@@ -1272,8 +1278,9 @@ export async function updateProjectIndex(
   // path that would otherwise trust a hash whose chunks are gone and skip the
   // file forever. Scoped to `in-progress` — see reconcileHashesWithStoredPoints.
   {
-    const persisted = await getProjectMetadata(collection);
-    if (persisted?.indexingStatus === "in-progress") {
+    // Strict read — see the note at the matching gate in indexProject.
+    const persisted = await loadIndexingStatus(collection);
+    if (persisted === "in-progress") {
       await reconcileHashesWithStoredPoints(collection, hashes, projectId);
     }
   }
