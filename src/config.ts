@@ -65,8 +65,16 @@ export function mainWorktreePath(projectPath: string): string | null {
       },
     ).trim();
     if (!commonDir) return null;
-    // A linked worktree's common dir is the MAIN checkout's .git directory, so
-    // its parent is the main worktree: /repo/.git -> /repo
+    // Only a conventional layout lets the checkout be inferred from the common
+    // dir, where it is <main>/.git and the parent is the main worktree.
+    //
+    // `git init --separate-git-dir` breaks that: the common dir is an external
+    // metadata directory that names no checkout at all, and it is reported
+    // identically from the main and the linked worktree. `git worktree list`
+    // cannot disambiguate either — it reports that metadata directory as the
+    // primary worktree. Resolving anything here would hand back metadata to be
+    // indexed, so resolve nothing and let the caller keep its own path.
+    if (!/[/\\]\.git[/\\]?$/.test(commonDir)) return null;
     const main = commonDir.replace(/[/\\]\.git[/\\]?$/, "");
     if (!main) return null;
     // Compare real paths: git reports the physical path, so on a platform where

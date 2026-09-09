@@ -40,6 +40,23 @@ function repoWithWorktree(): { main: string; linked: string } {
   return { main, linked };
 }
 
+/** The same, but with the git directory held outside the checkout. */
+function separateGitDirRepo(): { main: string; linked: string; admin: string } {
+  const base = fs.mkdtempSync(path.join(root, "sep-"));
+  const main = path.join(base, "main");
+  const admin = path.join(base, "admin");
+  execFileSync("git", ["init", "-b", "main", "--separate-git-dir", admin, main], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  git(["config", "user.name", "test"], main);
+  git(["config", "user.email", "test@test.com"], main);
+  git(["commit", "--allow-empty", "-m", "init"], main);
+
+  const linked = path.join(base, "linked");
+  git(["worktree", "add", "-b", "feature", linked], main);
+  return { main, linked, admin };
+}
+
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-worktree-"));
 });
@@ -63,6 +80,19 @@ describe("mainWorktreePath", () => {
 
   it("returns null for a path that does not exist", () => {
     expect(mainWorktreePath(path.join(root, "absent"))).toBeNull();
+  });
+
+  it("resolves nothing when the git directory is external, rather than returning metadata", () => {
+    // `git init --separate-git-dir` makes --git-common-dir an external metadata
+    // directory that names no checkout, and reports it identically from the main
+    // and the linked worktree. `git worktree list` is no help either: it names
+    // that same metadata directory as the primary worktree. Returning it would
+    // hand the caller a directory of git internals to index, which is worse than
+    // not resolving — so both paths must come back null and keep their own.
+    const { main, linked, admin } = separateGitDirRepo();
+    expect(mainWorktreePath(linked)).toBeNull();
+    expect(mainWorktreePath(main)).toBeNull();
+    expect(mainWorktreePath(linked)).not.toBe(admin);
   });
 
   it("makes both checkouts resolve to one project id", () => {
