@@ -58,6 +58,18 @@ describe("graph-resolution", () => {
     project = null;
   });
 
+  // Python resolution as the graph builder calls it: manifests discovered from
+  // the tree, roots scoped to the importing file. Shared by every Python
+  // describe below so the probe order under test is the production one.
+  const pyResolve = (spec: string, from: string, p: TempProject) => {
+    const manifests = buildPythonManifests(p.root);
+    const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
+    return resolveImport(
+      spec, path.join(p.root, from), p.root, p.fileSet, "python",
+      undefined, undefined, undefined, undefined, undefined, undefined, roots,
+    );
+  };
+
   describe("TypeScript/JavaScript resolution", () => {
     it("resolves relative imports with .js extension to .ts files", () => {
       project = createTempProject({
@@ -387,25 +399,6 @@ describe("graph-resolution", () => {
     // on: the roots the pyproject.toml manifests declare, scoped to the
     // importing file and tried nearest first.
 
-    const pyResolve = (spec: string, from: string, p: TempProject) => {
-      const manifests = buildPythonManifests(p.root);
-      const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
-      return resolveImport(
-        spec,
-        path.join(p.root, from),
-        p.root,
-        p.fileSet,
-        "python",
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        roots,
-      );
-    };
-
     // The reporter's layout: dashed distribution directory, intervening src/,
     // underscored module name — a three-way mismatch no name-shaped guess
     // can bridge. The root manifest declares the members, which is what puts
@@ -685,15 +678,6 @@ describe("graph-resolution", () => {
   });
 
   describe("sibling-flat fallback scope (#157)", () => {
-    const pyResolve = (spec: string, from: string, p: TempProject) => {
-      const manifests = buildPythonManifests(p.root);
-      const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
-      return resolveImport(
-        spec, path.join(p.root, from), p.root, p.fileSet, "python",
-        undefined, undefined, undefined, undefined, undefined, undefined, roots,
-      );
-    };
-
     it("does not guess a package's import into a same-named sibling", () => {
       // `src/pkg` holds __init__.py, so it is a regular package and is never
       // sys.path[0]. CPython resolves `import requests` through sys.path to
@@ -705,6 +689,22 @@ describe("graph-resolution", () => {
       });
 
       expect(pyResolve("requests", "src/pkg/client.py", project)).toBeNull();
+    });
+
+    it("gates a namespace subdirectory inside a regular package", () => {
+      // `src/pkg/vendor` carries no __init__.py of its own, but it sits under
+      // one, so it is a portion of the `pkg` tree and mod.py is reached as
+      // `pkg.vendor.mod`. Verified against CPython: `import requests` there
+      // loads the installed distribution, not the sibling. Gating only on
+      // sourceDir's own __init__.py caught src/pkg/client.py and missed this,
+      // which is the same fabricated edge one directory deeper.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/vendor/mod.py": "",
+        "src/pkg/vendor/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/vendor/mod.py", project)).toBeNull();
     });
 
     it("does not resolve a file to itself", () => {

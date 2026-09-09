@@ -2670,9 +2670,26 @@ export function resolveImport(
       // from the runnable script directory #46 exists to serve, so the
       // ambiguity is left as it is rather than guessed at. The self-edge
       // inside such a package is still removed, by the guard above.
-      const inPackage = fileSet.has(
-        path.posix.join(toForwardSlash(path.relative(projectPath, sourceDir)), "__init__.py"),
-      );
+      // Any ancestor up to the project root, not just `sourceDir` itself: a
+      // directory below a regular package is part of that package's tree even
+      // when it carries no `__init__.py` of its own. `src/pkg/vendor/mod.py`
+      // under `src/pkg/__init__.py` is reached as `pkg.vendor.mod` — verified
+      // against CPython, where `import requests` there loads the installed
+      // distribution and not the sibling `vendor/requests.py`. Checking only
+      // `sourceDir` gated `src/pkg/client.py` while leaving its own
+      // subdirectory fabricating the same edge.
+      let inPackage = false;
+      for (
+        let dir = toForwardSlash(path.relative(projectPath, sourceDir));
+        ;
+        dir = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : ""
+      ) {
+        if (fileSet.has(dir === "" ? "__init__.py" : `${dir}/__init__.py`)) {
+          inPackage = true;
+          break;
+        }
+        if (dir === "") break;
+      }
       const sibling = inPackage
         ? null
         : notSelf(resolveRelativePath(modulePath, sourceDir, projectPath, fileSet, [".py"]));
