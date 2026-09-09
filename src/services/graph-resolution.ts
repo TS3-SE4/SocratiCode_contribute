@@ -2600,9 +2600,17 @@ export function resolveImport(
       // Absolute: foo.bar.baz → foo/bar/baz.py or foo/bar/baz/__init__.py
       const modulePath = moduleSpecifier.replace(/\./g, "/");
 
-      const direct = notSelf(
-        resolveRelativePath(modulePath, projectPath, projectPath, fileSet, [".py"]),
-      );
+      // A self match HERE ends resolution rather than falling through. The
+      // project root is ahead of `src/`, `lib/` and every manifest root for a
+      // file that sits at the root — it is that file's own `sys.path[0]` — so
+      // nothing a later probe finds is a module CPython could reach past the
+      // source file itself. Root `mod.py` doing `import mod` beside a
+      // `src/mod.py` imports itself; answering with `src/mod.py` trades the
+      // self-edge for an edge to an unrelated module, which is worse. The
+      // later probes still fall through, because there the discarded match is
+      // a guess (the sibling probe) or one root among several.
+      const direct = resolveRelativePath(modulePath, projectPath, projectPath, fileSet, [".py"]);
+      if (direct === relSourceFile) return null;
       if (direct) return direct;
 
       // Try common Python source directories (src layout)
@@ -2630,14 +2638,25 @@ export function resolveImport(
       // root both offer the module, the sibling is what actually gets
       // imported.
       //
-      // Only for a file that could BE `sys.path[0]` (#157). A directory
-      // holding `__init__.py` is a regular package, and CPython never puts a
-      // package's own directory on `sys.path`: `import requests` from
-      // `src/pkg/client.py` is resolved through `sys.path` to the installed
-      // distribution, so a sibling `src/pkg/requests.py` is not what runs.
-      // Without this gate any first-party module sharing a name with a
-      // dependency invents an edge — the graph-wide version of the self-edge
-      // the guard above removes.
+      // Only for a directory that is not itself a regular package (#157). A
+      // directory holding `__init__.py` is imported as a package, and every
+      // documented way of importing one — installed distribution, `-m`, a
+      // path entry above it — resolves `import requests` from
+      // `src/pkg/client.py` through `sys.path` to the installed distribution,
+      // so a sibling `src/pkg/requests.py` is not what runs. Without this gate
+      // any first-party module sharing a name with a dependency invents an
+      // edge — the graph-wide version of the self-edge the guard above
+      // removes.
+      //
+      // The gate is a trade, not a law: `sys.path[0]` is the *script's*
+      // directory whether or not it holds `__init__.py`, so `python
+      // service-a/main.py` really does import a sibling `service-a/config.py`
+      // even when `service-a/__init__.py` exists, and that edge is dropped
+      // here. A name collision with a dependency is unfalsifiable from the
+      // tree, while a package directory at least says the file is normally
+      // reached as `pkg.client`; the false edge is judged the costlier of the
+      // two. The #46 layout the fallback serves — a runnable directory with no
+      // `__init__.py` — is unaffected.
       //
       // Deliberately NOT extended to PEP 420 namespace packages, which have
       // no `__init__.py` to test: `src/ns/sub/mod.py` importing `requests`

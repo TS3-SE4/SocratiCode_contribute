@@ -768,6 +768,46 @@ describe("graph-resolution", () => {
       expect(pyResolve("requests", "src/ns/sub/requests.py", project)).toBeNull();
     });
 
+    it("does not fall through a project-root self match into src/", () => {
+      // The root IS sys.path[0] for a file that sits there, so `import mod`
+      // from `mod.py` imports that same file — no later probe can name a
+      // module CPython would reach instead. Falling through answered with
+      // `src/mod.py`, an edge to an unrelated module: the self-edge traded for
+      // a wrong one rather than removed.
+      project = createTempProject({
+        "mod.py": "",
+        "src/mod.py": "",
+      });
+
+      expect(pyResolve("mod", "mod.py", project)).toBeNull();
+      // The src-layout file still reaches the root module; only the self
+      // match is discarded.
+      expect(pyResolve("mod", "src/mod.py", project)).toBe("mod.py");
+    });
+
+    it("drops a script-run package directory's sibling edge, as an accepted cost", () => {
+      // Pinned because it is a real loss, not a neutral refinement. `sys.path[0]`
+      // is the SCRIPT's directory whether or not it holds `__init__.py`, so
+      // `python service-a/main.py` genuinely imports `service-a/config.py`
+      // here and this edge is now missed — the same layout as the #46 test
+      // above, one `__init__.py` away.
+      //
+      // Accepted because the two errors are not symmetric. A name collision
+      // with a dependency cannot be falsified from the tree, so leaving the
+      // gate off invents edges wherever one occurs; a package directory at
+      // least says the file is normally reached as `pkg.client`, and running a
+      // script from inside a package is the layout Python itself discourages
+      // (relative imports fail there). If this proves wrong in the wild, the
+      // fix is a discriminator for "run as a script", not removing the gate.
+      project = createTempProject({
+        "service-a/__init__.py": "",
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBeNull();
+    });
+
     it("keeps probing after discarding a self match", () => {
       // A discarded self match must not end resolution. The legitimate answer
       // here is reachable ONLY by the manifest-root probe, which runs after
