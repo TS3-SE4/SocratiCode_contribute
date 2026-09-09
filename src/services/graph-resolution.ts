@@ -2576,12 +2576,14 @@ export function resolveImport(
       //
       // Every probe is guarded, but the disposition differs. The sibling probe
       // is a guess at a directory Python may not have on `sys.path` at all, so
-      // a self match there falls through to the next probe:
-      // `src/pkg/requests.py` importing `requests` must still find a
-      // legitimate `src/requests.py` behind the discarded match. Every other
-      // absolute probe stands for a real path entry, so a self match there
-      // ends resolution — see the comment above `direct`. The relative branch
-      // has nothing to fall through to: it reaches a self match for
+      // a self match there falls through to the probes behind it, which are
+      // the manifest-declared roots — the only ones that run after it:
+      // `packages/pkg-a/src/ns/requests.py` importing `requests` must still
+      // find the legitimate `packages/pkg-a/src/requests.py` that pkg-a's
+      // declared root supplies. Every other absolute probe stands for a real
+      // path entry, so a self match there ends resolution — see the comment
+      // above `direct`. The relative branch has nothing to fall through to:
+      // it reaches a self match for
       // `from . import x` written in a package's own `__init__.py`, which
       // resolves the bare `.` to that same `__init__.py` — the commonest
       // self-edge in any Python tree.
