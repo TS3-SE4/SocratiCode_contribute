@@ -256,6 +256,51 @@ export async function deleteCollection(name: string): Promise<void> {
   }
 }
 
+/**
+ * Scroll one payload field across an entire collection.
+ *
+ * Enumeration has to be complete, because callers use it to decide what exists.
+ * So this follows the cursor rather than taking the first page, retries a
+ * transient failure instead of returning a short answer, and stops if the
+ * cursor ever fails to advance — an unbounded cursor loop cannot be caught,
+ * since an infinite loop never throws.
+ *
+ * Only `field` is fetched. A point can carry a large payload — a project's
+ * entire path-to-hash map, in the metadata collection — so an unprojected read
+ * scales with the stored data rather than with the number of points.
+ */
+async function scrollPayloadField(
+  collName: string,
+  field: string,
+  label: string,
+  pageSize: number,
+  visit: (value: unknown) => void,
+): Promise<void> {
+  const qdrant = getClient();
+  let offset: string | number | Record<string, unknown> | undefined | null;
+
+  do {
+    const page = await withRetry(
+      () =>
+        qdrant.scroll(collName, {
+          limit: pageSize,
+          with_payload: { include: [field] },
+          with_vector: false,
+          ...(offset === undefined || offset === null ? {} : { offset }),
+        }),
+      label,
+    );
+    for (const point of page.points) visit(point.payload?.[field]);
+
+    const next = page.next_page_offset;
+    if (next !== undefined && next !== null && JSON.stringify(next) === JSON.stringify(offset)) {
+      logger.warn(`${label}: cursor did not advance, stopping`, { collName });
+      break;
+    }
+    offset = next;
+  } while (offset !== undefined && offset !== null);
+}
+
 /** List all codebase, codegraph, and context artifact entries.
  * Codebase and context entries are actual collections; codegraph entries come from metadata.
  *
@@ -279,21 +324,37 @@ export async function listCodebaseCollections(): Promise<string[]> {
   // Listing is read-only: an absent metadata collection means there are no metadata-only entries yet.
   if (collections.collections.some((collection) => collection.name === METADATA_COLLECTION)) {
     try {
-      const metaPoints = await qdrant.scroll(METADATA_COLLECTION, {
-        limit: 100,
-        with_payload: true,
-      });
-      for (const point of metaPoints.points) {
-        const collName = point.payload?.collectionName as string | undefined;
-        if (
-          (collName?.startsWith(`${p}codegraph_`) || collName?.startsWith(`${p}context_`)) &&
-          !result.includes(collName)
-        ) {
-          result.push(collName);
-        }
-      }
+      // This list must be complete: the manage tools present it as the set of
+      // indexed projects, and startup reads it to decide what to resume. The
+      // previous single unpaginated request silently dropped everything past
+      // the hundredth point, and fetched every project's whole hash map to
+      // read one string per point.
+      const seen = new Set(result);
+      await scrollPayloadField(
+        METADATA_COLLECTION,
+        "collectionName",
+        "listCodebaseCollections(metadata)",
+        1000,
+        (value) => {
+          // Narrow rather than cast: optional chaining guards null and
+          // undefined, so a non-string here would have reached `.startsWith`
+          // and thrown, taking out a read-only listing over one bad point.
+          if (typeof value !== "string") return;
+          if (
+            (value.startsWith(`${p}codegraph_`) || value.startsWith(`${p}context_`)) &&
+            !seen.has(value)
+          ) {
+            seen.add(value);
+            result.push(value);
+          }
+        },
+      );
     } catch (err) {
-      logger.info("listCodebaseCollections: metadata scroll failed", {
+      // Non-fatal: this is a read-only listing and the collections found above
+      // stand. Warned rather than logged at info because paging made a partial
+      // result more reachable, not less — a failure can now land on page three
+      // of five and return a list that looks complete.
+      logger.warn("listCodebaseCollections: metadata scroll failed, list may be incomplete", {
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -839,28 +900,16 @@ export async function listIndexedFilePaths(
   collName: string,
   pageSize = 1000,
 ): Promise<Set<string>> {
-  const qdrant = getClient();
   const paths = new Set<string>();
-  let offset: string | number | Record<string, unknown> | undefined | null;
-
-  do {
-    const page = await withRetry(
-      () =>
-        qdrant.scroll(collName, {
-          limit: pageSize,
-          with_payload: { include: ["relativePath"] },
-          with_vector: false,
-          ...(offset === undefined || offset === null ? {} : { offset }),
-        }),
-      `listIndexedFilePaths(${collName})`,
-    );
-    for (const point of page.points) {
-      const rel = point.payload?.relativePath;
-      if (typeof rel === "string") paths.add(rel);
-    }
-    offset = page.next_page_offset;
-  } while (offset !== undefined && offset !== null);
-
+  await scrollPayloadField(
+    collName,
+    "relativePath",
+    `listIndexedFilePaths(${collName})`,
+    pageSize,
+    (value) => {
+      if (typeof value === "string") paths.add(value);
+    },
+  );
   return paths;
 }
 
