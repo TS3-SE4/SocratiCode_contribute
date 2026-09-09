@@ -160,16 +160,77 @@ describe("MAX_CHUNK_CHARS", () => {
       expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
     });
 
+    it("prefers a blank line over a space when both are in the window", async () => {
+      // Treating every candidate as equally good puts splits mid-statement: a
+      // scan that takes the first space it walks back onto cuts
+      // `compute(a, b)` after `compute(a,` when a blank line sat earlier in the
+      // window. The tiers exist so the strongest break available wins.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      const para = (n: number) =>
+        `paragraph ${n}: ${"word ".repeat(40)}`.trimEnd();
+      const content = [para(1), para(2), para(3), para(4)].join("\n\n");
+      const pieces = splitTextToCharCap(content, 500);
+
+      expect(pieces.map((p) => p.text).join("")).toBe(content);
+      // Every piece but the last ends on the blank line, not mid-sentence.
+      for (const p of pieces.slice(0, -1)) {
+        expect(p.text.endsWith("\n\n")).toBe(true);
+      }
+    });
+
+    it("splits code at the end of a block rather than inside a statement", async () => {
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      // Four functions with no blank line between them, so the strongest
+      // boundary available is the closing brace on its own line.
+      const fn = (n: number) =>
+        `function f${n}() {\n${Array.from({ length: 12 }, (_, i) => `  const v${i} = compute(a, b, c, d);`).join("\n")}\n}`;
+      const content = [fn(1), fn(2), fn(3), fn(4)].join("\n");
+      const pieces = splitTextToCharCap(content, 1200, "typescript");
+
+      expect(pieces.map((p) => p.text).join("")).toBe(content);
+      for (const p of pieces.slice(0, -1)) {
+        // The whole closing line stays with the piece, newline included: the
+        // boundary means "this line closes a block", so the unit is the line.
+        expect(p.text.endsWith("\n}\n")).toBe(true);
+      }
+    });
+
+    it("starts a Markdown piece at a heading, not one character after it", async () => {
+      // A heading opens the section it introduces, so the split has to land
+      // before the match. Cutting after "\n#" would strand one # at the end of
+      // the previous piece.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      const section = (n: number) =>
+        `## Section ${n}\n\n${Array.from({ length: 6 }, () => "Some prose that runs on for a while to fill the section body.").join("\n")}`;
+      const content = [section(1), section(2), section(3), section(4)].join("\n\n");
+      const pieces = splitTextToCharCap(content, 700, "markdown");
+
+      expect(pieces.map((p) => p.text).join("")).toBe(content);
+      expect(pieces.length).toBeGreaterThan(1);
+      // Each piece after the first opens on its heading (a leading newline from
+      // the blank line before it is fine).
+      for (const p of pieces.slice(1)) {
+        expect(p.text.trimStart().startsWith("## Section")).toBe(true);
+      }
+      // No piece ends on a stranded hash.
+      for (const p of pieces) {
+        expect(p.text.endsWith("#")).toBe(false);
+      }
+    });
+
     it("stops the boundary scan before it produces a very short piece", async () => {
       // chunkByCharacters scanned back to the start of the window, so a single
       // separator early in a window produced a piece of that length — 101
-      // characters against a 600 cap in the worst case found. The scan now
-      // stops at BOUNDARY_SCAN_RATIO of the target and splits at the target if
-      // it finds nothing.
+      // characters against a 600 cap in the worst case found. Each tier now
+      // carries a reach, and the split lands at the target when nothing is
+      // within it.
       const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
 
-      // The only separator sits at index 100, far outside the last fifth of a
-      // 600-character window.
+      // The only separator is a space at index 100. A space reaches 20% of the
+      // target, so it is far outside the window's reach.
       const content = `${"a".repeat(100)} ${"b".repeat(1700)}`;
       const pieces = splitTextToCharCap(content, 600);
 
@@ -179,6 +240,188 @@ describe("MAX_CHUNK_CHARS", () => {
         // Nothing anywhere near the 101-character piece the unbounded scan gave.
         expect(p.text.length).toBeGreaterThan(600 * 0.5);
       }
+    });
+
+    it("reaches a blank line just as far in Markdown as in code", async () => {
+      // A tier's reach belongs to the tier, not to its position in the list.
+      // Markdown ranks three kinds of break above a blank line, and if reach
+      // followed position that would shorten what a blank line can reach —
+      // narrowing the scan for the most common break in prose, in the very
+      // language the Markdown tiers exist to serve.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      const paragraphs = ["a", "b", "c", "d"].map((c) => c.repeat(500)).join("\n\n");
+
+      const asCode = splitTextToCharCap(paragraphs, 1000);
+      const asMarkdown = splitTextToCharCap(paragraphs, 1000, "markdown");
+
+      expect(asMarkdown.map((p) => p.text.length)).toEqual(asCode.map((p) => p.text.length));
+      // Both split on the blank lines, which sit at half the target.
+      for (const p of asMarkdown) {
+        expect(p.text.length).toBeGreaterThan(1000 * 0.5);
+      }
+      expect(asMarkdown.map((p) => p.text).join("")).toBe(paragraphs);
+    });
+
+    it("ends a Markdown piece at a sentence rather than a later word", async () => {
+      // ". " outranks a bare space, so it has to sit in a tier of its own: every
+      // match of ". " is also a match of " " at the same index, so sharing a
+      // tier would leave it unable to change a split point at all.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      // A sentence end at 1300, a plain space further on at 1400. The target is
+      // 1500, so the scan reaches both.
+      const chars = Array(3000).fill("a");
+      chars[1299] = ".";
+      chars[1300] = " ";
+      chars[1400] = " ";
+      const content = chars.join("");
+
+      const pieces = splitTextToCharCap(content, 1500, "markdown");
+
+      expect(pieces[0].text.endsWith(". ")).toBe(true);
+      expect(pieces.map((p) => p.text).join("")).toBe(content);
+    });
+
+    it("rejects a cap below 1 in chunkFileContent rather than looping", async () => {
+      // The env-var path rejects it already, but chunkFileContent takes the cap
+      // as an argument and is exported, so a caller can reach this. A cap of 0
+      // would leave the split point equal to the offset and emit empty pieces
+      // forever.
+      const { chunkFileContent } = await import("../../src/services/indexer.js");
+
+      const content = `${Array(200).fill("const value = compute(a, b);").join("\n")}\n`;
+
+      for (const cap of [0, -1, 1.5]) {
+        expect(() =>
+          chunkFileContent("t.ts", "t.ts", content, { maxChunkChars: cap }),
+        ).toThrow(/maxChunkChars must be a positive integer/);
+      }
+    });
+
+    it("does not treat a closing code fence as the start of a block", async () => {
+      // A fence looks the same opening a block and closing one. Cutting before a
+      // closing fence puts a bare fence at the start of the next piece and ends
+      // the current one inside the block — the mirror of the stranded "#" that
+      // cutting before an opener avoids. An opening fence is told apart by its
+      // info string, which a closing fence never has.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      const bare = (text: string) => /^```+[ \t]*$/.test(text.split("\n")[0]);
+
+      const document = (closing: string) =>
+        `${[
+          ...Array(10).fill("Paragraph of prose here, long enough to matter."),
+          "```js",
+          ...Array(8).fill("const value = compute(a, b);"),
+          closing,
+          "",
+          ...Array(10).fill("Trailing paragraph of prose that pushes the document out."),
+        ].join("\n")}\n`;
+
+      // CommonMark lets a closing fence be followed by spaces or tabs, so those
+      // are not an info string: the test is whether the rest of the line holds
+      // anything else.
+      for (const closing of ["```", "``` ", "```\t", "```  "]) {
+        const doc = document(closing);
+        const pieces = splitTextToCharCap(doc, 620, "markdown");
+        for (const piece of pieces) expect(bare(piece.text)).toBe(false);
+        expect(pieces.map((p) => p.text).join("")).toBe(doc);
+      }
+
+      // The splitter is handed one chunk, not the file, so a window can begin
+      // inside a code block. Counting fences would invert the parity here and
+      // read every closing fence as an opener; an info string does not care
+      // where the window starts.
+      const midBlock = `${[
+        ...Array(20).fill("inside the block, a line of code"),
+        "```",
+        "",
+        ...Array(20).fill("after the block, a line of prose"),
+      ].join("\n")}\n`;
+
+      const midPieces = splitTextToCharCap(midBlock, 620, "markdown");
+      for (const piece of midPieces) expect(bare(piece.text)).toBe(false);
+      expect(midPieces.map((p) => p.text).join("")).toBe(midBlock);
+    });
+
+    it("keeps a closing line whole rather than cutting after the bracket", async () => {
+      // A closing bracket rarely is the whole line: `});`, `): FileChunk[] {`
+      // and `} from "../x.js";` all start with one. Cutting immediately after
+      // the bracket splits the line, which is what ranking the boundary was
+      // meant to avoid.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      for (const closing of ["});", "): FileChunk[] {", '} from "../x.js";']) {
+        const content = `${"a".repeat(300)}\nfoo(\n  bar,\n${closing}\n${"b".repeat(300)}`;
+        const pieces = splitTextToCharCap(content, 340);
+        const lines = content.split("\n");
+
+        for (const piece of pieces) {
+          const firstLine = piece.text.split("\n")[0];
+          const fileLine = lines[piece.startLine - 1];
+          // A piece starting mid-line holds only the tail of its first line.
+          const startsMidLine =
+            fileLine !== undefined &&
+            firstLine !== fileLine &&
+            fileLine.endsWith(firstLine) &&
+            firstLine.length < fileLine.length;
+          expect(startsMidLine).toBe(false);
+        }
+        expect(pieces.map((p) => p.text).join("")).toBe(content);
+      }
+    });
+
+    it("never splits a CRLF between the carriage return and the newline", async () => {
+      // CRLF is one line ending, not two characters to divide. Cutting between
+      // them leaves a stray "\r" at the end of one piece and starts the next
+      // with a bare "\n", which reads as a blank line the file does not have.
+      // Reachable only where no boundary was found and the split landed at the
+      // target, which a small cap makes common.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      const content = `${Array(12).fill("const value = compute(a, b);").join("\r\n")}\r\n`;
+
+      for (let cap = 1; cap <= 60; cap++) {
+        const pieces = splitTextToCharCap(content, cap);
+
+        for (let i = 0; i < pieces.length - 1; i++) {
+          const dividedLineEnding =
+            pieces[i].text.endsWith("\r") && pieces[i + 1].text.startsWith("\n");
+          expect(dividedLineEnding).toBe(false);
+        }
+        expect(pieces.map((p) => p.text).join("")).toBe(content);
+      }
+    });
+
+    it("finds a blank line under CRLF as well as LF", async () => {
+      // "\n\n" does not occur in a CRLF file: the blank line is "\r\n\r\n". Without
+      // a boundary for it the strongest rank never matches there, and the split
+      // silently falls through to the newline rank's shorter reach.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      for (const newline of ["\n", "\r\n"]) {
+        const content = `${"a".repeat(825)}${newline}${newline}${"b".repeat(2173 - newline.length * 2)}`;
+        const pieces = splitTextToCharCap(content, 2000);
+
+        expect(pieces[0].text.endsWith(`${newline}${newline}`)).toBe(true);
+        expect(pieces.map((p) => p.text).join("")).toBe(content);
+      }
+    });
+
+    it("does not split a member chain when a word boundary is available", async () => {
+      // `.` ends a sentence in prose, but in code it sits inside a member chain
+      // far more often than it ends anything. Ranking it above a space would
+      // cut `config.value` in two with a space right there to use instead.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+
+      const content = `${"x".repeat(60)} config.value ${"y".repeat(60)}`;
+      const pieces = splitTextToCharCap(content, 70);
+
+      for (const p of pieces) {
+        expect(p.text.endsWith("config.")).toBe(false);
+      }
+      expect(pieces.map((p) => p.text).join("")).toBe(content);
     });
 
     it("gives every piece of a split chunk a distinct id", async () => {
@@ -243,28 +486,6 @@ describe("MAX_CHUNK_CHARS", () => {
       }
       // Each chunk holds two of the six lines, in order, with no gap.
       expect(chunks.map((c) => `${c.startLine}-${c.endLine}`)).toEqual(["1-2", "3-4", "5-6"]);
-    });
-
-    it("never splits a CRLF between the carriage return and the newline", async () => {
-      // CRLF is one line ending, not two characters to divide. Cutting between
-      // them leaves a stray "\r" at the end of one piece and starts the next
-      // with a bare "\n", which reads as a blank line the file does not have.
-      // Reachable only where no boundary was found and the split landed at the
-      // target, which a small cap makes common.
-      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
-
-      const content = `${Array(12).fill("const value = compute(a, b);").join("\r\n")}\r\n`;
-
-      for (let cap = 1; cap <= 60; cap++) {
-        const pieces = splitTextToCharCap(content, cap);
-
-        for (let i = 0; i < pieces.length - 1; i++) {
-          const dividedLineEnding =
-            pieces[i].text.endsWith("\r") && pieces[i + 1].text.startsWith("\n");
-          expect(dividedLineEnding).toBe(false);
-        }
-        expect(pieces.map((p) => p.text).join("")).toBe(content);
-      }
     });
 
     it("never splits between the halves of a surrogate pair", async () => {

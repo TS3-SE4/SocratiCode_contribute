@@ -593,11 +593,11 @@ function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk
 
 /**
  * Character-based chunking for minified/bundled content whose average line
- * length exceeds MAX_AVG_LINE_LENGTH. Splits at safe token boundaries
- * (newline, space, tab, semicolon, comma) where one is available near the end
- * of the window, so chunks stay within MAX_CHUNK_CHARS and usually avoid
- * splitting mid-identifier. See splitTextToCharCap for how far back the scan
- * looks and what it does when it finds nothing.
+ * length exceeds MAX_AVG_LINE_LENGTH. Splits on the strongest structural
+ * boundary each window offers, so chunks stay within MAX_CHUNK_CHARS and a
+ * piece tends to end where the text itself divides. The ranked boundaries
+ * differ by language and are listed in splitTextToCharCap, along with how far
+ * back the scan looks for each rank and what it does when it finds nothing.
  *
  * NOTE: The chunk `id` uses the byte offset as its discriminator (not the
  * line number) because minified files may consist of a single very long
@@ -611,7 +611,7 @@ function chunkByCharacters(
   maxChunkChars: number,
 ): FileChunk[] {
   let offset = 0;
-  return splitTextToCharCap(content, maxChunkChars).map((piece) => {
+  return splitTextToCharCap(content, maxChunkChars, language).map((piece) => {
     const chunk: FileChunk = {
       id: chunkId(relativePath, offset), // byte offset → unique ID even for 1-line files
       filePath,

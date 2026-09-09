@@ -198,7 +198,10 @@ const DEFAULT_MAX_CHUNK_CHARS = 2000;
  * The cap is a split boundary on every path, not a truncation point.
  * `chunkFileContent` and `chunkArtifactContent` both cut by line count
  * (CHUNK_SIZE), so a chunk can come out longer than a cap counted in
- * characters; `splitToCharCap` then divides it into as many chunks as it needs.
+ * characters; `splitToCharCap` then divides it into as many chunks as it needs,
+ * at the strongest structural boundary each window offers (a blank line before
+ * a mere newline, a newline before a space; Markdown ranks headings and code
+ * fences above blank lines).
  * No content is dropped, so a lower cap yields more chunks rather than less
  * indexed content. (Chunks still overlap where the strategy that produced them
  * overlaps — CHUNK_OVERLAP lines on the line-based path — and a piece holding

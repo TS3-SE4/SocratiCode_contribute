@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { glob } from "glob";
 import { contextCollectionName, projectIdFromPath } from "../config.js";
-import { CHUNK_OVERLAP, CHUNK_SIZE, DETECT_HEAD_BYTES, MAX_CHUNK_CHARS } from "../constants.js";
+import { CHUNK_OVERLAP, CHUNK_SIZE, DETECT_HEAD_BYTES, getLanguageFromExtension, MAX_CHUNK_CHARS } from "../constants.js";
 import type { ArtifactIndexState, ContextArtifact, SearchResult } from "../types.js";
 import { continuationId, splitTextToCharCap } from "./chunk-split.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
@@ -390,6 +390,11 @@ export function chunkArtifactContent(
   const lines = content.split("\n");
   if (lines.length === 0) return [];
 
+  // Artifacts carry no language of their own, but the split wants to know
+  // whether to look for headings and code fences or for statement ends. The
+  // extension is the only signal available here.
+  const artifactLanguage = getLanguageFromExtension(path.extname(artifactPath).toLowerCase());
+
   const chunks: ArtifactChunk[] = [];
 
   for (let start = 0; start < lines.length; start += CHUNK_SIZE - CHUNK_OVERLAP) {
@@ -399,7 +404,7 @@ export function chunkArtifactContent(
 
     // Text at or below the cap comes back as a single piece, so the common case
     // is unchanged: one chunk, the parent's own id and line range.
-    const pieces = splitTextToCharCap(chunkContent, maxChunkChars);
+    const pieces = splitTextToCharCap(chunkContent, maxChunkChars, artifactLanguage);
     for (const [index, piece] of pieces.entries()) {
       // A window that is mostly padding splits into pieces that hold nothing but
       // whitespace. Each would otherwise cost an embedding call, occupy a point

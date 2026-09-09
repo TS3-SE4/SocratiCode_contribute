@@ -14,21 +14,36 @@
  *   npm run build                                        # this reads dist/, not src/
  *   node scripts/measure-chunk-coverage.mjs <path to a repository> [cap]
  *
- * It reports four things, each with the raw numerator and denominator so the
- * arithmetic can be checked:
+ * It reports seven things. Every figure that is a proportion comes with its
+ * numerator and denominator, so the arithmetic can be checked:
  *
- *   1. Lossless check — the strongest of the four. Concatenating every chunk of
- *      a file must reproduce what an uncapped run produces. Splitting reorders
- *      nothing and invents nothing, so the two strings are identical when no
- *      content is dropped. A mismatch is a defect; the count of mismatching
- *      files is the headline number.
- *   2. Never-indexed characters — how much of the file never reaches any chunk.
+ *   1. Lossless check — the strongest of the seven, and exact: concatenating
+ *      every chunk of a file must reproduce what an uncapped run produces, byte
+ *      for byte. Splitting reorders nothing and invents nothing, so the two
+ *      strings are identical when no content is dropped. A mismatch is a
+ *      defect; the count of mismatching files is the headline number.
+ *   2. Files losing whitespace only — the same comparison, for files whose one
+ *      difference is deleted whitespace. Dropping a blank piece is deliberate,
+ *      and it drops whitespace from only the capped side, so this is expected
+ *      rather than a defect: 14 of this repository's files at a cap of 20.
+ *      Counting it apart keeps (1) exact, which matters because a divided CRLF
+ *      leaves a stray carriage return and nothing else.
+ *   3. Never-indexed characters — how much of the file never reaches any chunk.
  *      Measured per line, against the file's own character count.
- *   3. Chunk counts — what the cap costs in embedding calls.
- *   4. Chunk id collisions — two chunks sharing an id means Qdrant's upsert
+ *   4. Chunk counts — what the cap costs in embedding calls.
+ *   5. Characters sent to embedding — summed over chunk contents, so
+ *      overlapping windows count their shared lines twice. This is the total an
+ *      embedding provider is handed, which the per-line coverage in (3) is
+ *      deliberately not: do not read one as the other.
+ *   6. Chunk size — the median, and how many chunks fall under 1000 characters.
+ *      A cap decides how finely content is divided, and dividing it more finely
+ *      costs embedding calls without adding content, so these say what a change
+ *      to the boundary rules costs. Comparing two builds on this needs
+ *      --compare, since the sizes depend on where splits land.
+ *   7. Chunk id collisions — two chunks sharing an id means Qdrant's upsert
  *      keeps only one of them.
  *
- * Read (1) and (2) together. Per-line coverage cannot represent a line split
+ * Read (1) and (3) together. Per-line coverage cannot represent a line split
  * across several chunks, so once the cap splits rather than truncates it
  * under-reports: it charges the whole line to the longest single chunk holding
  * part of it. A run showing 0 files losing content and a small non-zero
@@ -42,7 +57,7 @@
  * academic — a repository whose own notes are indexable changes between runs.
  */
 
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
@@ -95,6 +110,62 @@ function coveredChars(lines, chunks) {
   return covered.reduce((n, x, i) => n + Math.min(x, lines[i].length), 0);
 }
 
+/**
+ * The newest mtime under a directory, or null when it cannot be read.
+ *
+ * Recursive, since src/ is nested. Only the newest value matters, so nothing is
+ * collected.
+ */
+async function newestMtime(dir) {
+  let newest = null;
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await newestMtime(full);
+      if (nested !== null && (newest === null || nested > newest)) newest = nested;
+      continue;
+    }
+    try {
+      const { mtimeMs } = await stat(full);
+      if (newest === null || mtimeMs > newest) newest = mtimeMs;
+    } catch {
+      // Unreadable entry: it cannot make the build stale on its own.
+    }
+  }
+  return newest;
+}
+
+/**
+ * Whether `b` is `a` with some whitespace deleted and nothing else changed.
+ *
+ * Walked greedily: every character of `b` must appear in `a` in order, and
+ * every character of `a` that `b` skips must be whitespace. That is exactly the
+ * shape a dropped blank piece leaves, and it separates "the capped run lost a
+ * blank line" from "the capped run lost content".
+ */
+function isWhitespaceOnlyDeletion(a, b) {
+  let i = 0;
+  for (let j = 0; j < b.length; j++) {
+    while (i < a.length && a[i] !== b[j]) {
+      if (!/\s/.test(a[i])) return false;
+      i++;
+    }
+    if (i >= a.length) return false;
+    i++;
+  }
+  while (i < a.length) {
+    if (!/\s/.test(a[i])) return false;
+    i++;
+  }
+  return true;
+}
+
 /** An empty tally for one build. */
 function emptyTally() {
   return {
@@ -104,6 +175,10 @@ function emptyTally() {
     idCollisions: 0,
     mismatchingFiles: 0,
     charsDroppedByConcat: 0,
+    whitespaceOnlyFiles: 0,
+    whitespaceDropped: 0,
+    chunkChars: 0,
+    chunkSizes: [],
     fileChars: 0,
     coveredChars: 0,
     ids: new Set(),
@@ -123,19 +198,37 @@ function tallyFile(t, chunkFileContent, filePath, rel, content, cap) {
   for (const c of capped) {
     if (t.ids.has(c.id)) t.idCollisions += 1;
     t.ids.add(c.id);
+    // Summed over chunks, so overlapping windows count their shared lines
+    // twice. This is what an embedding provider is actually sent, which the
+    // per-line coverage below deliberately is not.
+    t.chunkChars += c.content.length;
+    t.chunkSizes.push(c.content.length);
   }
 
-  // (1) Lossless check. Both sides drop chunks with no non-whitespace content —
-  // that is a deliberate invariant, not lost content — so those are excluded
-  // from the comparison. Without this, a file padded with indented blank lines
-  // reads as though the split threw content away.
+  // (1) Lossless check, byte for byte. Concatenating a file's chunks must
+  // reproduce what an uncapped run produces.
+  //
+  // Dropping a chunk with no non-whitespace content is a deliberate invariant,
+  // not lost content, and excluding those chunks is not symmetric: the uncapped
+  // run puts a whole file in one chunk, which trim() never empties, so its
+  // whitespace stays, while the capped run loses whatever whitespace formed a
+  // blank piece. Normalising whitespace away would hide that difference — and
+  // with it any loss of whitespace at all, including the stray carriage return
+  // a divided CRLF leaves behind, which this file exists to prevent. So the
+  // comparison stays exact and the two kinds of difference are counted apart:
+  // a file whose only difference is deleted whitespace is its own figure.
   const meaningful = (chunks) =>
     chunks.filter((c) => c.content.trim().length > 0).map((c) => c.content).join("");
   const a = meaningful(uncapped);
   const b = meaningful(capped);
   if (a !== b) {
-    t.mismatchingFiles += 1;
-    t.charsDroppedByConcat += a.length - b.length;
+    if (isWhitespaceOnlyDeletion(a, b)) {
+      t.whitespaceOnlyFiles += 1;
+      t.whitespaceDropped += a.length - b.length;
+    } else {
+      t.mismatchingFiles += 1;
+      t.charsDroppedByConcat += a.length - b.length;
+    }
   }
 
   // (2) Never-indexed characters. The minified path splits a single line across
@@ -157,9 +250,24 @@ function report(label, r) {
   console.log(`--- ${label} ---`);
   console.log(`  files chunked                ${r.files} (minified path: ${r.minifiedFiles}, excluded from coverage)`);
   console.log(`  chunks                       ${r.chunks}`);
+  console.log(`  characters sent to embedding ${r.chunkChars}   (summed over chunks; overlapping windows counted twice)`);
+  const sizes = [...r.chunkSizes].sort((a, b) => a - b);
+  // The mean of the two middle values when the count is even, so the figure is
+  // the median rather than the upper of the pair.
+  const middle = sizes.length / 2;
+  const median =
+    sizes.length === 0
+      ? 0
+      : sizes.length % 2 === 1
+        ? sizes[Math.floor(middle)]
+        : (sizes[middle - 1] + sizes[middle]) / 2;
+  const small = sizes.filter((n) => n < 1000).length;
+  console.log(`  median chunk                 ${median} characters`);
+  console.log(`  chunks under 1000 characters ${small} / ${sizes.length}   ->  ${pct(small, sizes.length)}`);
   console.log(`  chunk id collisions          ${r.idCollisions}`);
   console.log(`  files losing content         ${r.mismatchingFiles} / ${r.files}`);
-  console.log(`  characters dropped           ${r.charsDroppedByConcat}`);
+  console.log(`  characters dropped           ${r.charsDroppedByConcat}   (overlapping windows counted twice)`);
+  console.log(`  files losing whitespace only ${r.whitespaceOnlyFiles} / ${r.files}   (${r.whitespaceDropped} characters; blank pieces are dropped deliberately)`);
   console.log(`  characters in files measured ${r.fileChars}   (denominator; newlines and the minified path excluded)`);
   console.log(`  characters reaching a chunk  ${r.coveredChars}   (numerator)`);
   console.log(`  never indexed                ${lost} = ${r.fileChars} - ${r.coveredChars}  ->  ${pct(lost, r.fileChars)}`);
@@ -183,12 +291,15 @@ const ownIndexer = path.join(here, "..", "dist", "services", "indexer.js");
 // This measures the build, not the sources. Saying so is not enough: a stale
 // dist/ silently reports the previous build's numbers, and the whole point of
 // this script is that its numbers can be trusted.
+//
+// The whole of src/ is walked rather than one file. Comparing against
+// indexer.ts alone would miss an unbuilt edit to chunk-split.ts, which is where
+// the boundary ranking lives — the most likely file to be editing while running
+// this.
 try {
-  const [distStat, srcStat] = await Promise.all([
-    stat(ownIndexer),
-    stat(path.join(here, "..", "src", "services", "indexer.ts")),
-  ]);
-  if (distStat.mtimeMs < srcStat.mtimeMs) {
+  const distStat = await stat(ownIndexer);
+  const newestSource = await newestMtime(path.join(here, "..", "src"));
+  if (newestSource !== null && distStat.mtimeMs < newestSource) {
     console.error("warning: dist/ is older than src/ — run `npm run build` first\n");
   }
 } catch {
