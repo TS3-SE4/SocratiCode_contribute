@@ -1332,6 +1332,13 @@ export async function indexProject(
   // Auto-index context artifacts if .socraticodecontextartifacts.json exists
   try {
     const artifactConfig = await loadConfig(resolvedPath);
+    // Ownership can be lost while loadConfig is pending, and this run would
+    // then start a fresh write to the context collection for a project it no
+    // longer owns. The gate before this phase cannot see that, so check again
+    // once the await has resolved and before anything is written.
+    postIndexCancelled = stopIfCancelled();
+    if (postIndexCancelled) return postIndexCancelled;
+
     if (artifactConfig?.artifacts?.length) {
       progress.phase = "indexing context artifacts";
       onProgress?.(`Indexing ${artifactConfig.artifacts.length} context artifact${artifactConfig.artifacts.length === 1 ? "" : "s"}...`);
@@ -1796,6 +1803,13 @@ export async function updateProjectIndex(
   // Auto-index context artifacts if changed (non-fatal)
   try {
     const artifactConfig = await loadConfig(resolvedPath);
+    // Ownership can be lost while loadConfig is pending, and this run would
+    // then start a fresh write to the context collection for a project it no
+    // longer owns. The gate before this phase cannot see that, so check again
+    // once the await has resolved and before anything is written.
+    postIndexCancelled = stopIfCancelled();
+    if (postIndexCancelled) return postIndexCancelled;
+
     if (artifactConfig?.artifacts?.length) {
       progress.phase = "indexing context artifacts";
       const result = await ensureArtifactsIndexed(resolvedPath);
@@ -1808,9 +1822,10 @@ export async function updateProjectIndex(
     logger.warn("Context artifact indexing failed during incremental update (non-fatal)", { projectPath: resolvedPath, error: artifactMsg });
   }
 
-  onProgress?.(`Update complete: ${added} added, ${updated} updated, ${removed} removed`);
   postIndexCancelled = stopIfCancelled();
   if (postIndexCancelled) return postIndexCancelled;
+
+  onProgress?.(`Update complete: ${added} added, ${updated} updated, ${removed} removed`);
 
   lastCompleted.set(resolvedPath, {
     type: "incremental-update",

@@ -147,9 +147,30 @@ vi.mock("../../src/services/code-graph.js", () => ({
   removeGraph: vi.fn(async () => undefined),
 }));
 
+/** When set, the lock is lost while the artifact config read is pending. */
+let fireDuringLoadConfig = false;
+/** When set, the lock is lost while artifact indexing is in flight. */
+let fireDuringArtifacts = false;
+
 vi.mock("../../src/services/context-artifacts.js", () => ({
-  loadConfig: vi.fn(async () => ({ artifacts: [{ name: "docs" }] })),
-  ensureArtifactsIndexed: vi.fn(async () => ({ reindexed: [], upToDate: [] })),
+  loadConfig: vi.fn(async () => {
+    if (fireDuringLoadConfig) {
+      fireDuringLoadConfig = false;
+      // Resolve a turn first, so the compromise genuinely lands while the
+      // caller is awaiting rather than before the call.
+      await Promise.resolve();
+      compromise?.(new Error("ENOENT: lock file no longer exists"));
+    }
+    return { artifacts: [{ name: "docs" }] };
+  }),
+  ensureArtifactsIndexed: vi.fn(async () => {
+    if (fireDuringArtifacts) {
+      fireDuringArtifacts = false;
+      await Promise.resolve();
+      compromise?.(new Error("ENOENT: lock file no longer exists"));
+    }
+    return { reindexed: [], upToDate: [] };
+  }),
   removeAllArtifacts: vi.fn(async () => undefined),
 }));
 
@@ -177,6 +198,8 @@ beforeEach(async () => {
   fireOnNextEmbed = false;
   fireOnCompletedUpsert = false;
   fireDuringGraphRebuild = false;
+  fireDuringLoadConfig = false;
+  fireDuringArtifacts = false;
   cancelDuringCompletedUpsert = null;
   lastMetadata = null;
   storedPoints = 0;
@@ -365,5 +388,46 @@ describe("indexProject when the lock is lost mid-run", () => {
     expect(vi.mocked(ensureArtifactsIndexed)).not.toHaveBeenCalled();
     // And nothing was written to metadata after the terminal status.
     expect(savedStatuses.at(-1)).toBe("completed");
+  });
+
+  it("does not start artifact indexing when the lock is lost during the config read", async () => {
+    // The gate before this phase runs before `loadConfig` is awaited, so a
+    // compromise arriving while that read is pending is invisible to it. Left
+    // unchecked, the run would go straight on to write to the context
+    // collection for a project it no longer owns.
+    const indexer = await import("../../src/services/indexer.js");
+    const { ensureArtifactsIndexed } = await import("../../src/services/context-artifacts.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "loadconfig-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+
+    fireDuringLoadConfig = true;
+    const result = await indexer.indexProject(project);
+
+    expect(result.cancelled).toBe(true);
+    expect(vi.mocked(ensureArtifactsIndexed)).not.toHaveBeenCalled();
+    expect(savedStatuses.at(-1)).toBe("completed");
+  });
+
+  it("does not announce completion on an incremental run that was cancelled", async () => {
+    // The success message used to be emitted before the final check, so a
+    // cancelled run told the caller it had completed and then returned
+    // cancelled. The full-index path checked first, so the two flows also
+    // disagreed with each other.
+    const indexer = await import("../../src/services/indexer.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "announce-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+    await indexer.indexProject(project);
+
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 2;\n");
+    // The lock must be lost in the *final* phase: cancelling any earlier stops
+    // the run before the completion message is reached at all, which would make
+    // this pass whichever order the two lines are in.
+    const messages: string[] = [];
+    fireDuringArtifacts = true;
+    const result = await indexer.updateProjectIndex(project, (m) => messages.push(m));
+
+    expect(result.cancelled).toBe(true);
+    expect(messages.some((m) => m.startsWith("Update complete"))).toBe(false);
+    expect(messages.some((m) => m.includes("cancelled"))).toBe(true);
   });
 });
