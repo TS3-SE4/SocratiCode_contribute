@@ -29,10 +29,10 @@ import { detectExtensionFromSource, resolveExtensionlessExtension } from "./exte
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import {
   documentTextProfile,
+  type EffectiveIndexProfile,
   ensureEffectiveEmbeddingReady,
   profileExtensionLanguageMap,
   resolveEffectiveIndexProfile,
-  type EffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
 import { acquireProjectLock, releaseProjectLock } from "./lock.js";
