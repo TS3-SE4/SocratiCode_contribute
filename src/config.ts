@@ -27,65 +27,6 @@ export function detectGitBranch(projectPath: string): string | null {
   }
 }
 
-/** True when two paths denote the same directory, following symlinks. */
-function samePath(a: string, b: string): boolean {
-  try {
-    return fs.realpathSync(a) === fs.realpathSync(b);
-  } catch {
-    return path.resolve(a) === path.resolve(b);
-  }
-}
-
-/**
- * The main worktree of the repository containing `projectPath`.
- *
- * Returns `null` when the path is not inside a git repository, when git is
- * unavailable, or when the path already *is* the main worktree.
- *
- * A linked worktree is a second checkout of the same repository and carries the
- * same `.socraticode.json`, so it resolves to the same project id and therefore
- * the same collections. Indexing one as though it were its own project writes a
- * different file tree into the main checkout's collections: files the worktree
- * does not have are pruned from the index, and the recorded project path points
- * at a directory that can be removed at any time.
- *
- * Callers that mean "whatever project this directory belongs to" should resolve
- * first, so every checkout of a repository maps to one index.
- */
-export function mainWorktreePath(projectPath: string): string | null {
-  try {
-    const commonDir = execFileSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      {
-        cwd: path.resolve(projectPath),
-        encoding: "utf-8",
-        timeout: 5000,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    ).trim();
-    if (!commonDir) return null;
-    // Only a conventional layout lets the checkout be inferred from the common
-    // dir, where it is <main>/.git and the parent is the main worktree.
-    //
-    // `git init --separate-git-dir` breaks that: the common dir is an external
-    // metadata directory that names no checkout at all, and it is reported
-    // identically from the main and the linked worktree. `git worktree list`
-    // cannot disambiguate either — it reports that metadata directory as the
-    // primary worktree. Resolving anything here would hand back metadata to be
-    // indexed, so resolve nothing and let the caller keep its own path.
-    if (!/[/\\]\.git[/\\]?$/.test(commonDir)) return null;
-    const main = commonDir.replace(/[/\\]\.git[/\\]?$/, "");
-    if (!main) return null;
-    // Compare real paths: git reports the physical path, so on a platform where
-    // the caller's path crosses a symlink (macOS /var -> /private/var) a plain
-    // resolve() would make the main checkout look like a linked worktree.
-    return samePath(main, projectPath) ? null : path.resolve(main);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Sanitize a git branch name for use in Qdrant collection names.
  * Replaces characters outside `[a-zA-Z0-9_-]` with underscores,

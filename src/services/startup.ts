@@ -10,7 +10,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { collectionName, mainWorktreePath, projectIdFromPath } from "../config.js";
+import { collectionName, projectIdFromPath } from "../config.js";
 import { QDRANT_COLLECTION_PREFIX, QDRANT_MODE } from "../constants.js";
 import { isGraphBuildInProgress } from "./code-graph.js";
 import { isDockerAvailable, isQdrantRunning } from "./docker.js";
@@ -97,29 +97,12 @@ export async function autoResumeIndexedProjects(projectPath?: string): Promise<v
     }
 
     // Default: only consider the current project
-    const requestedPath = projectPath ?? process.cwd();
+    const resolvedPath = projectPath ?? process.cwd();
 
-    // If CWD is root or home, the MCP host hasn't opened a specific project yet — skip.
-    // Checked before resolving, so a home directory that happens to be a git
-    // repository still counts as "no project opened".
-    if (requestedPath === "/" || requestedPath === process.env.HOME) {
-      logger.info("Auto-resume: CWD is root/home, no specific project — skipping", { projectPath: requestedPath });
+    // If CWD is root or home, the MCP host hasn't opened a specific project yet — skip
+    if (resolvedPath === "/" || resolvedPath === process.env.HOME) {
+      logger.info("Auto-resume: CWD is root/home, no specific project — skipping", { projectPath: resolvedPath });
       return;
-    }
-
-    // A host opened in a linked worktree is still working on the same project:
-    // the worktree carries the same .socraticode.json, so it resolves to the
-    // same project id and the same collections. Resuming it under its own path
-    // would index a different file tree into the main checkout's index —
-    // pruning files the worktree does not have — and record a project path that
-    // disappears when the worktree is removed.
-    const mainPath = mainWorktreePath(requestedPath);
-    const resolvedPath = mainPath ?? requestedPath;
-    if (mainPath) {
-      logger.info("Auto-resume: resolved linked worktree to its main checkout", {
-        requested: requestedPath,
-        projectPath: mainPath,
-      });
     }
 
     const collections = await listCodebaseCollections();
