@@ -137,6 +137,14 @@ export async function getPersistedIndexingStatus(projectPath: string): Promise<"
 
 /** Request graceful cancellation of an in-flight indexing operation.
  *  The operation will stop after the current batch finishes and checkpoint. */
+export function requestCancellation(projectPath: string): boolean {
+  const resolved = path.resolve(projectPath);
+  if (!indexingInProgress.has(resolved)) return false;
+  cancellationRequested.set(resolved, true);
+  logger.info("Cancellation requested — will stop after current batch", { projectPath: resolved });
+  return true;
+}
+
 /**
  * Stand down when the index lock is lost mid-run.
  *
@@ -150,20 +158,17 @@ export async function getPersistedIndexingStatus(projectPath: string): Promise<"
  * reconciles it. That makes standing down safe even when the compromise was
  * spurious — the cost is one resumable run, against two processes writing to
  * one collection.
+ *
+ * `requestCancellation` no-ops if the run is not registered yet, which cannot
+ * happen here: registration follows the lock acquisition with no `await`
+ * between them, and this runs from proper-lockfile's timer, which cannot fire
+ * during synchronous execution.
  */
 function cancelBecauseLockWasLost(projectPath: string): void {
   logger.warn("Index lock lost while indexing — cancelling to avoid racing the new holder", {
     projectPath,
   });
   requestCancellation(projectPath);
-}
-
-export function requestCancellation(projectPath: string): boolean {
-  const resolved = path.resolve(projectPath);
-  if (!indexingInProgress.has(resolved)) return false;
-  cancellationRequested.set(resolved, true);
-  logger.info("Cancellation requested — will stop after current batch", { projectPath: resolved });
-  return true;
 }
 
 /** Check whether cancellation has been requested for a project */

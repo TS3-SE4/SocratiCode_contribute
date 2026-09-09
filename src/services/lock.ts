@@ -58,15 +58,16 @@ function lockFilePath(key: string): string {
  * @param onCompromised - Called if the lock is lost while still held. The lock
  *   guards a shared collection, so losing it means another process may now be
  *   writing to what this one is still writing to; the caller is the only thing
- *   that knows how to stand down. Failures inside the callback are logged and
- *   swallowed — it runs from proper-lockfile's timer, where a throw has nowhere
- *   to go.
+ *   that knows how to stand down. It runs from proper-lockfile's timer, where
+ *   nothing is waiting on it, so both a synchronous throw and a rejected
+ *   promise are logged and swallowed rather than becoming an unhandled
+ *   rejection.
  * @returns true if the lock was acquired, false if another process holds it
  */
 export async function acquireProjectLock(
   projectPath: string,
   operation: string,
-  onCompromised?: (err: Error) => void,
+  onCompromised?: (err: Error) => void | Promise<void>,
 ): Promise<boolean> {
   ensureLockDir();
 
@@ -97,14 +98,20 @@ export async function acquireProjectLock(
           error: err.message,
         });
         heldLocks.delete(key);
-        try {
-          onCompromised?.(err);
-        } catch (handlerErr) {
+        const logHandlerFailure = (handlerErr: unknown) => {
           logger.warn("Lock compromise handler failed", {
             projectPath,
             operation,
             error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
           });
+        };
+        try {
+          // The handler is invoked synchronously, so a caller standing down
+          // takes effect immediately; only its rejection is deferred. A
+          // synchronous throw still reaches the catch below.
+          void Promise.resolve(onCompromised?.(err)).catch(logHandlerFailure);
+        } catch (handlerErr) {
+          logHandlerFailure(handlerErr);
         }
       },
     });

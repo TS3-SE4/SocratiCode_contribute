@@ -161,6 +161,26 @@ describe("acquireProjectLock", () => {
 
     expect(() => compromise?.(new Error("reclaimed"))).not.toThrow();
   });
+
+  it("swallows a handler that rejects, not just one that throws", async () => {
+    // The callback runs from proper-lockfile's timer with nothing awaiting it,
+    // so a rejected promise would surface as an unhandled rejection rather than
+    // being caught by the try/catch around the synchronous call.
+    const { logger } = await import("../../src/services/logger.js");
+    const { acquireProjectLock } = await import("../../src/services/lock.js");
+    await acquireProjectLock(tmp, "index", async () => {
+      throw new Error("async handler blew up");
+    });
+
+    compromise?.(new Error("reclaimed"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      "Lock compromise handler failed",
+      expect.objectContaining({ error: "async handler blew up" }),
+    );
+  });
 });
 
 describe("indexProject when the lock is lost mid-run", () => {
@@ -168,10 +188,13 @@ describe("indexProject when the lock is lost mid-run", () => {
     const indexer = await import("../../src/services/indexer.js");
     const project = await fsp.mkdtemp(path.join(tmp, "project-"));
 
-    // INDEX_BATCH_SIZE is 50 and cancellation is checked at the top of each
-    // batch, so a single-batch project would finish before the flag was ever
-    // read and would pass whether or not the handler is wired.
-    for (let i = 0; i < 60; i++) {
+    // Cancellation is checked at the top of each batch, so a single-batch
+    // project would finish before the flag was ever read and would pass whether
+    // or not the handler is wired. Derived from the constant rather than
+    // hard-coded, so a change to the batch size cannot quietly reduce this to
+    // one batch.
+    const { INDEX_BATCH_SIZE } = await import("../../src/constants.js");
+    for (let i = 0; i < INDEX_BATCH_SIZE + 10; i++) {
       await fsp.writeFile(path.join(project, `f${i}.ts`), `export const v${i} = ${i};\n`);
     }
 
