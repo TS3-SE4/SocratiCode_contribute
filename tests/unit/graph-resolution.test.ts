@@ -517,6 +517,24 @@ describe("graph-resolution", () => {
       ).toBeNull();
     });
 
+    it("holds that principle when a first-party sibling shares the module name", () => {
+      // The assertion above passes partly because nothing in the fixture is
+      // called `requests`. Add one and the sibling probe reached past the
+      // declared roots and answered with it, turning "absent from every
+      // declared root" into a fabricated first-party edge (#157). The
+      // importing directory is a package, so the sibling is not on sys.path
+      // for this file and the third-party import stays unresolved.
+      project = createTempProject({
+        ...workspace,
+        "packages/adapter-sos/src/adapter_sos/__init__.py": "",
+        "packages/adapter-sos/src/adapter_sos/requests/adapters.py": "",
+      });
+
+      expect(
+        pyResolve("requests.adapters", "packages/adapter-sos/src/adapter_sos/db.py", project),
+      ).toBeNull();
+    });
+
     it("returns null for a src-layout import when no roots are passed", () => {
       // Back-compat pin: every pre-#107 caller omits the list, and that
       // omission must reproduce the old behavior exactly rather than
@@ -663,6 +681,95 @@ describe("graph-resolution", () => {
       });
 
       expect(pyResolve("os", "src/pkg_a/main.py", project)).toBeNull();
+    });
+  });
+
+  describe("sibling-flat fallback scope (#157)", () => {
+    let project: TempProject;
+    afterEach(() => project?.cleanup());
+
+    const pyResolve = (spec: string, from: string, p: TempProject) => {
+      const manifests = buildPythonManifests(p.root);
+      const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
+      return resolveImport(
+        spec, path.join(p.root, from), p.root, p.fileSet, "python",
+        undefined, undefined, undefined, undefined, undefined, undefined, roots,
+      );
+    };
+
+    it("does not guess a package's import into a same-named sibling", () => {
+      // `src/pkg` holds __init__.py, so it is a regular package and is never
+      // sys.path[0]. CPython resolves `import requests` through sys.path to
+      // the installed distribution; the sibling file is not what runs.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/client.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/client.py", project)).toBeNull();
+    });
+
+    it("does not resolve a file to itself", () => {
+      // The first-party module named after the package it wraps. No Python
+      // import produces a dependency on the importing file.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
+    });
+
+    it("does not resolve a file to itself in the #46 layout the fallback serves", () => {
+      // No __init__.py, so the sibling fallback still applies here and must:
+      // `import config` keeps resolving. Only the self match is discarded,
+      // which no package gate could reach — the two guards are independent.
+      project = createTempProject({
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+        "service-a/requests.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBe("service-a/config.py");
+      expect(pyResolve("requests", "service-a/requests.py", project)).toBeNull();
+    });
+
+    it("leaves the PEP 420 namespace-package collision resolved, by choice", () => {
+      // Pinned as a decision, not an oversight. `src/ns/sub` has no
+      // __init__.py, so the package gate cannot see it, and the alternative
+      // discriminator — "sourceDir sits below a declared import root" — also
+      // fires on packages/pkg-a/src/pkg_a and would invert "prefers the
+      // sibling-flat guess over a manifest root" above. Such a directory is
+      // indistinguishable from the runnable script directory #46 serves, so
+      // the sibling stands. Only the self-edge is removed.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "ns-demo"\n',
+        "src/ns/sub/mod.py": "",
+        "src/ns/sub/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/ns/sub/mod.py", project)).toBe("src/ns/sub/requests.py");
+      expect(pyResolve("requests", "src/ns/sub/requests.py", project)).toBeNull();
+    });
+
+    it("keeps probing after discarding a self match", () => {
+      // A discarded self match must not end resolution. The legitimate answer
+      // here is reachable ONLY by the manifest-root probe, which runs after
+      // the sibling probe: the project-root and src/ probes both miss, so if
+      // the self match ended the chain the real edge would be lost. `src` is
+      // an import root for pkg-a and `src/ns` is not, so CPython imports
+      // packages/pkg-a/src/requests.py for this file.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/requests.py": "",
+        "packages/pkg-a/src/ns/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "packages/pkg-a/src/ns/requests.py", project)).toBe(
+        "packages/pkg-a/src/requests.py",
+      );
     });
   });
 

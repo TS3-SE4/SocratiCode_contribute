@@ -2578,14 +2578,37 @@ export function resolveImport(
       }
       // Absolute: foo.bar.baz → foo/bar/baz.py or foo/bar/baz/__init__.py
       const modulePath = moduleSpecifier.replace(/\./g, "/");
-      const direct = resolveRelativePath(modulePath, projectPath, projectPath, fileSet, [".py"]);
+
+      // No import edge from a file to itself (#157). A module that names
+      // itself is resolvable in CPython — `import mymodule` inside a
+      // top-level `mymodule.py` really does import a second copy — but as a
+      // graph edge it is noise, and every case seen in the wild is a
+      // first-party module named after the third-party package it wraps
+      // (`whisperx.py` doing `import whisperx`), where the true target is the
+      // installed distribution and no first-party edge exists at all.
+      //
+      // A rejected candidate falls through to the next probe rather than
+      // ending resolution: `src/pkg/requests.py` importing `requests` must
+      // still find a legitimate `src/requests.py` behind the discarded self
+      // match. Only the sibling probe can reach here on the layouts in #157,
+      // but `direct` reaches it too for a module at the project root, so the
+      // guard sits on every absolute probe rather than on one of them.
+      const relSourceFile = toForwardSlash(path.relative(projectPath, sourceFile));
+      const notSelf = (candidate: string | null): string | null =>
+        candidate === null || candidate === relSourceFile ? null : candidate;
+
+      const direct = notSelf(
+        resolveRelativePath(modulePath, projectPath, projectPath, fileSet, [".py"]),
+      );
       if (direct) return direct;
 
       // Try common Python source directories (src layout)
       const pySrcDirs = ["src", "lib"];
       for (const dir of pySrcDirs) {
-        const inSrc = resolveRelativePath(
-          path.join(dir, modulePath), projectPath, projectPath, fileSet, [".py"],
+        const inSrc = notSelf(
+          resolveRelativePath(
+            path.join(dir, modulePath), projectPath, projectPath, fileSet, [".py"],
+          ),
         );
         if (inSrc) return inSrc;
       }
@@ -2603,7 +2626,34 @@ export function resolveImport(
       // installed-distribution entry, so where a sibling file and a package
       // root both offer the module, the sibling is what actually gets
       // imported.
-      const sibling = resolveRelativePath(modulePath, sourceDir, projectPath, fileSet, [".py"]);
+      //
+      // Only for a file that could BE `sys.path[0]` (#157). A directory
+      // holding `__init__.py` is a regular package, and CPython never puts a
+      // package's own directory on `sys.path`: `import requests` from
+      // `src/pkg/client.py` is resolved through `sys.path` to the installed
+      // distribution, so a sibling `src/pkg/requests.py` is not what runs.
+      // Without this gate any first-party module sharing a name with a
+      // dependency invents an edge — the graph-wide version of the self-edge
+      // the guard above removes.
+      //
+      // Deliberately NOT extended to PEP 420 namespace packages, which have
+      // no `__init__.py` to test: `src/ns/sub/mod.py` importing `requests`
+      // beside `src/ns/sub/requests.py` still resolves to the sibling. The
+      // structural discriminator that would catch it — "sourceDir sits below
+      // a declared import root" — is unusable, because it also fires on
+      // `packages/pkg-a/src/pkg_a/main.py`, whose roots include
+      // `packages/pkg-a/src`, and would invert "prefers the sibling-flat
+      // guess over a manifest root" below. A directory with neither
+      // `__init__.py` nor a manifest of its own is genuinely indistinguishable
+      // from the runnable script directory #46 exists to serve, so the
+      // ambiguity is left as it is rather than guessed at. The self-edge
+      // inside such a package is still removed, by the guard above.
+      const inPackage = fileSet.has(
+        path.posix.join(toForwardSlash(path.relative(projectPath, sourceDir)), "__init__.py"),
+      );
+      const sibling = inPackage
+        ? null
+        : notSelf(resolveRelativePath(modulePath, sourceDir, projectPath, fileSet, [".py"]));
       if (sibling) return sibling;
 
       // Manifest-declared import roots (issue #107), nearest first. The probes
@@ -2617,8 +2667,10 @@ export function resolveImport(
       // and not a declared workspace member never appears here, and a package's
       // own root is tried before a sibling package's.
       for (const importRoot of pythonImportRoots ?? []) {
-        const inRoot = resolveRelativePath(
-          path.posix.join(importRoot, modulePath), projectPath, projectPath, fileSet, [".py"],
+        const inRoot = notSelf(
+          resolveRelativePath(
+            path.posix.join(importRoot, modulePath), projectPath, projectPath, fileSet, [".py"],
+          ),
         );
         if (inRoot) return inRoot;
       }
