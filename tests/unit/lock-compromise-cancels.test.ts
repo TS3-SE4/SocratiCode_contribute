@@ -22,7 +22,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /** proper-lockfile's compromise callback, captured at acquire time. */
 let compromise: ((err: Error) => void) | null = null;
-let embedCalls = 0;
+/** When set, the next metadata upsert fires the compromise once. */
+let fireOnNextUpsert = false;
+/** When set, the next embedding batch fires the compromise once. */
+let fireOnNextEmbed = false;
+/**
+ * Last metadata payload written, echoed back by `retrieve`, and a count of
+ * stored chunk points. Without both, `updateProjectIndex` sees an empty
+ * collection and delegates to `indexProject` — so a test aimed at its own
+ * terminal write would never reach it.
+ */
+let lastMetadata: Record<string, unknown> | null = null;
+let storedPoints = 0;
 /** Every indexingStatus value written to the metadata collection. */
 const savedStatuses: string[] = [];
 
@@ -50,7 +61,7 @@ vi.mock("@qdrant/js-client-rest", () => ({
     }
     async getCollection() {
       return {
-        points_count: 0,
+        points_count: storedPoints,
         status: "green",
         config: { params: { vectors: { dense: { size: 3, distance: "Cosine" } } } },
       };
@@ -62,12 +73,21 @@ vi.mock("@qdrant/js-client-rest", () => ({
     }
     async delete() {}
     async retrieve() {
-      return [];
+      return lastMetadata === null ? [] : [{ payload: lastMetadata }];
     }
     async upsert(_c: string, body: { points: Array<{ payload?: Record<string, unknown> }> }) {
+      if (fireOnNextUpsert) {
+        fireOnNextUpsert = false;
+        compromise?.(new Error("ENOENT: lock file no longer exists"));
+      }
       for (const p of body.points) {
-        const s = p.payload?.indexingStatus;
-        if (typeof s === "string") savedStatuses.push(s);
+        const status = p.payload?.indexingStatus;
+        if (typeof status === "string") {
+          savedStatuses.push(status);
+          lastMetadata = p.payload ?? null;
+        } else {
+          storedPoints++;
+        }
       }
     }
   },
@@ -86,11 +106,11 @@ vi.mock("../../src/services/embedding-provider.js", () => ({
 vi.mock("../../src/services/embeddings.js", () => ({
   prepareDocumentText: vi.fn((content: string) => content),
   generateEmbeddings: vi.fn(async (texts: string[]) => {
-    embedCalls++;
-    // Lose the lock while the first batch is in flight. Cancellation is checked
-    // between batches, so the run must have more than one batch for this to be
-    // observable at all — see the file count below.
-    if (embedCalls === 1) compromise?.(new Error("ENOENT: lock file no longer exists"));
+    // Opt-in per test: a run used only as setup must not lose its lock.
+    if (fireOnNextEmbed) {
+      fireOnNextEmbed = false;
+      compromise?.(new Error("ENOENT: lock file no longer exists"));
+    }
     return texts.map(() => [0.1, 0.1, 0.1]);
   }),
 }));
@@ -122,7 +142,10 @@ let tmp = "";
 beforeEach(async () => {
   vi.resetModules();
   compromise = null;
-  embedCalls = 0;
+  fireOnNextUpsert = false;
+  fireOnNextEmbed = false;
+  lastMetadata = null;
+  storedPoints = 0;
   savedStatuses.length = 0;
   process.env = {
     ...originalEnv,
@@ -198,6 +221,7 @@ describe("indexProject when the lock is lost mid-run", () => {
       await fsp.writeFile(path.join(project, `f${i}.ts`), `export const v${i} = ${i};\n`);
     }
 
+    fireOnNextEmbed = true;
     const result = await indexer.indexProject(project);
 
     expect(result.cancelled).toBe(true);
@@ -205,5 +229,47 @@ describe("indexProject when the lock is lost mid-run", () => {
     // holder and then declared the collection healthy.
     expect(savedStatuses).not.toContain("completed");
     expect(savedStatuses).toContain("in-progress");
+  });
+
+  it("does not complete when the compromise lands during the final batch", async () => {
+    // The batch loop checks at the top of each batch, so a compromise inside
+    // the last one is never seen there. A single-batch project makes that the
+    // only case: without a terminal gate the run marks the collection healthy
+    // while another process may have been writing to it.
+    const indexer = await import("../../src/services/indexer.js");
+    const { INDEX_BATCH_SIZE } = await import("../../src/constants.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "single-batch-"));
+    for (let i = 0; i < Math.max(1, INDEX_BATCH_SIZE - 10); i++) {
+      await fsp.writeFile(path.join(project, `f${i}.ts`), `export const v${i} = ${i};\n`);
+    }
+
+    fireOnNextEmbed = true;
+    const result = await indexer.indexProject(project);
+
+    expect(result.cancelled).toBe(true);
+    expect(savedStatuses).not.toContain("completed");
+  });
+
+  it("does not complete when nothing changed and the compromise lands anyway", async () => {
+    // An update with no changed files skips the batch loop entirely, so there
+    // is no in-loop check to reach. It still deletes chunks for missing files
+    // and still writes the terminal status.
+    const indexer = await import("../../src/services/indexer.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "no-change-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+
+    await indexer.indexProject(project);
+    expect(savedStatuses).toContain("completed");
+
+    savedStatuses.length = 0;
+    fireOnNextUpsert = true;
+    const result = await indexer.updateProjectIndex(project);
+
+    // Nothing was re-indexed, so this genuinely took the incremental path
+    // rather than delegating to a full index.
+    expect(result.added).toBe(0);
+    expect(result.chunksCreated).toBe(0);
+    expect(result.cancelled).toBe(true);
+    expect(savedStatuses).not.toContain("completed");
   });
 });

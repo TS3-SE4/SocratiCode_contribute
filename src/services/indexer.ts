@@ -171,6 +171,26 @@ function cancelBecauseLockWasLost(projectPath: string): void {
   requestCancellation(projectPath);
 }
 
+/**
+ * Whether a changed path could alter the code graph.
+ *
+ * The graph is built from files ast-grep can parse, so editing one it cannot —
+ * a README, a JSON fixture, a lockfile — produces a byte-identical graph. The
+ * rebuild is a whole-repository operation (measured at 15.9s over 2,713 files
+ * and 26.8s over 3,872), and it ran on any change at all, so a one-line
+ * documentation commit paid for it in full.
+ *
+ * An extensionless path counts as relevant. The indexer resolves those to a
+ * language by reading the file, and guessing wrong here would silently stop
+ * rebuilding the graph for a real source file — a wrong graph is worse than a
+ * redundant rebuild.
+ */
+function couldAffectCodeGraph(relativePath: string): boolean {
+  const ext = path.extname(relativePath);
+  if (ext === "") return true;
+  return getAstGrepLang(ext) !== null;
+}
+
 /** Check whether cancellation has been requested for a project */
 function isCancellationRequested(resolvedPath: string): boolean {
   return cancellationRequested.get(resolvedPath) === true;
@@ -1176,6 +1196,26 @@ export async function indexProject(
   const filesIndexed = hashes.size;
   const chunksCreated = totalChunksCreated;
 
+  // The batch loop's check cannot see a cancellation that arrives during the
+  // final batch, and a run with no batches never reaches it at all. Either way
+  // the flag would be set and never read, and this transition would then tell
+  // the next run the collection is healthy — suppressing the reconciliation
+  // that repairs it. The checkpoints above already persisted `in-progress`, so
+  // returning here leaves the collection recoverable.
+  if (isCancellationRequested(resolvedPath)) {
+    onProgress?.(`Indexing cancelled before completion (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
+    logger.info("Indexing cancelled before the completed transition", { projectPath: resolvedPath, chunksIndexed: chunksCreated });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
+  }
+
   // Final metadata save
   progress.phase = "saving metadata";
   await saveProjectMetadata(
@@ -1563,6 +1603,25 @@ export async function updateProjectIndex(
     }
   }
 
+  // Same terminal gate as the full index, and it matters more here: the removal
+  // loop above deletes chunks, and the batch loop is skipped entirely when
+  // nothing changed, so a cancellation can arrive with no later check to read
+  // it. Persisting `completed` over a half-removed collection is precisely the
+  // state the reconciliation on resume exists to repair.
+  if (isCancellationRequested(resolvedPath)) {
+    onProgress?.(`Update cancelled before completion (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
+    logger.info("Incremental update cancelled before the completed transition", { projectPath: resolvedPath, chunksCreated });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  }
+
   // Persist updated hashes
   await saveProjectMetadata(
     collection,
@@ -1578,9 +1637,18 @@ export async function updateProjectIndex(
   //
   // While every changed or removed file requires a complete symbol-graph rebuild,
   // bypass the incremental branch and perform one complete graph rebuild.
-  if (added > 0 || updated > 0 || removed > 0) {
+  //
+  // Gated on whether anything the graph is built from actually changed: the
+  // rebuild covers the whole repository, so a change to a file ast-grep cannot
+  // parse would spend that on producing the graph that already exists.
+  const graphAffectingPaths = [
+    ...changedFiles.map((file) => file.relativePath),
+    ...removedRelPaths,
+  ].filter(couldAffectCodeGraph);
+
+  if (graphAffectingPaths.length > 0) {
     progress.phase = "building code graph";
-    const totalChanged = changedFiles.length + removedRelPaths.length;
+    const totalChanged = graphAffectingPaths.length;
 
     try {
       onProgress?.(
