@@ -108,18 +108,12 @@ vi.mock("../../src/services/qdrant.js", () => ({
   }),
 }));
 
-// getAstGrepLang stays real: the incremental update now asks it whether a
-// changed file can affect the graph, so a stub answering "never" would silently
-// suppress every rebuild these tests assert on.
-vi.mock("../../src/services/code-graph.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../src/services/code-graph.js")>();
-  return {
-    ...actual,
-    ensureDynamicLanguages: vi.fn(),
-    rebuildGraph: vi.fn(async () => ({ nodes: [], edges: [] })),
-    removeGraph: vi.fn(async () => undefined),
-  };
-});
+vi.mock("../../src/services/code-graph.js", () => ({
+  ensureDynamicLanguages: vi.fn(),
+  getAstGrepLang: vi.fn(() => null),
+  rebuildGraph: vi.fn(async () => ({ nodes: [], edges: [] })),
+  removeGraph: vi.fn(async () => undefined),
+}));
 
 vi.mock("../../src/services/elixir-templates.js", () => ({
   analyzeElixirTemplate: vi.fn(() => null),
@@ -427,14 +421,10 @@ describe("code-index effective profile compatibility", () => {
     const indexer = await loadIndexer();
     const { legacyIndexProfile } = await import("../../src/services/index-profile.js");
     const { rebuildGraph } = await import("../../src/services/code-graph.js");
-    // A source file, not the .txt this used to use: the graph is now rebuilt
-    // only for files it is actually built from, and this case is about not
-    // rebuilding twice. The skip for an unparseable file has its own coverage
-    // in graph-rebuild-gating.test.ts.
-    const project = await createProject("notes.ts", "export const changed = 1;");
+    const project = await createProject("notes.txt", "new changed content");
     collectionInfo = { pointsCount: 1, status: "green" };
     storedProfile = legacyIndexProfile("code");
-    storedHashes = new Map([["notes.ts", indexer.hashContent("old source")]]);
+    storedHashes = new Map([["notes.txt", indexer.hashContent("old source")]]);
 
     vi.mocked(rebuildGraph).mockClear();
     const result = await indexer.updateProjectIndex(project);

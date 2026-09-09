@@ -141,6 +141,19 @@ export async function acquireProjectLock(
 }
 
 /**
+ * Whether this process still holds the lock for a project operation.
+ *
+ * `onCompromised` removes the entry when proper-lockfile reports the lock lost,
+ * so this answers false from the moment ownership is known to be gone. Callers
+ * use it to decide whether a write they were about to make is still theirs to
+ * make — once another process may hold the lock, the safe move is to stop
+ * rather than to correct, since a correction would overwrite the new holder.
+ */
+export function holdsProjectLock(projectPath: string, operation: string): boolean {
+  return heldLocks.has(lockKey(projectPath, operation));
+}
+
+/**
  * Release a previously acquired lock.
  *
  * @param projectPath - Absolute path to the project directory

@@ -35,7 +35,7 @@ import {
   resolveEffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
-import { acquireProjectLock, releaseProjectLock } from "./lock.js";
+import { acquireProjectLock, holdsProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import {
   type CollectionInfo,
@@ -173,39 +173,21 @@ function cancelBecauseLockWasLost(projectPath: string): void {
 }
 
 /**
- * Whether a changed path could alter the code graph.
+ * Persist the terminal `completed` status, and undo it only while this process
+ * still owns the project lock.
  *
- * The graph is built from files ast-grep can parse, so editing one it cannot —
- * a README, a JSON fixture, a lockfile — produces a byte-identical graph. The
- * rebuild is a whole-repository operation (measured at 15.9s over 2,713 files
- * and 26.8s over 3,872), and it ran on any change at all, so a one-line
- * documentation commit paid for it in full.
+ * The gate before the call cannot close the window on its own:
+ * `saveProjectMetadata` is asynchronous and a compromise arrives from
+ * proper-lockfile's timer, so cancellation can land after the check and before
+ * the write does.
  *
- * An extensionless path counts as relevant. The indexer resolves those to a
- * language by reading the file, and guessing wrong here would silently stop
- * rebuilding the graph for a real source file — a wrong graph is worse than a
- * redundant rebuild.
- */
-function couldAffectCodeGraph(relativePath: string): boolean {
-  const ext = path.extname(relativePath);
-  if (ext === "") return true;
-  return getAstGrepLang(ext) !== null;
-}
-
-/**
- * Persist the terminal `completed` status, and put it back to `in-progress` if
- * the lock was lost while that write was in flight.
- *
- * The gate before the call cannot close this window on its own:
- * `saveProjectMetadata` is asynchronous and the compromise callback runs from a
- * timer, so cancellation can arrive after the check and before the write lands.
- *
- * A fence token at the write boundary would be the airtight answer, and Qdrant
- * does not offer one — a point upsert takes no version precondition, so there
- * is nothing that could make the write itself refuse once ownership is gone.
- * What is achievable is to notice and repair. Another process can still observe
- * `completed` for the length of one round trip, but the collection is left
- * `in-progress` at rest, and that is what the next run's reconciliation reads.
+ * The repair is therefore conditional on ownership rather than on cancellation
+ * alone. A user-requested stop leaves the lock held, so the status can safely be
+ * put back. A lost lock means another process may already have written its own
+ * status and hashes, and correcting ours would overwrite theirs — so once
+ * ownership is known to be gone, no further write is started at all. Qdrant
+ * offers no conditional upsert to distinguish the two after the fact, which is
+ * exactly why the decision is made before writing rather than after.
  *
  * Returns whether `completed` stands.
  */
@@ -229,10 +211,18 @@ async function persistCompletedUnlessLockLost(
 
   if (!isCancellationRequested(resolvedPath)) return true;
 
-  logger.warn(
-    "Lock was lost while the completed status was being written — reverting to in-progress so the next run reconciles",
-    { projectPath: resolvedPath, collection },
-  );
+  if (!holdsProjectLock(resolvedPath, "index")) {
+    logger.warn(
+      "Cancelled while completing and the lock is no longer held — leaving metadata alone rather than overwriting the new holder",
+      { projectPath: resolvedPath, collection },
+    );
+    return false;
+  }
+
+  logger.warn("Cancelled while the completed status was being written — reverting to in-progress", {
+    projectPath: resolvedPath,
+    collection,
+  });
   await saveProjectMetadata(
     collection,
     resolvedPath,
@@ -1293,6 +1283,37 @@ export async function indexProject(
     return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
   }
 
+  // Post-terminal phases are long, asynchronous, and write to collections the
+  // reconciliation does not cover — the code graph, the symbol graph and the
+  // context artifacts. A lock lost during any of them leaves this process
+  // writing to a project it no longer owns, and previously the run carried on
+  // through every remaining phase and then reported success. Check between
+  // phases and stop instead.
+  const stopIfCancelled = (): {
+    filesIndexed: number;
+    chunksCreated: number;
+    cancelled: boolean;
+  } | null => {
+    if (!isCancellationRequested(resolvedPath)) return null;
+    onProgress?.(`Indexing cancelled during ${progress.phase} (${chunksCreated} chunks saved). The index itself is written; re-run codebase_index to finish the remaining work.`);
+    logger.info("Indexing cancelled during post-index work", {
+      projectPath: resolvedPath,
+      phase: progress.phase,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: filesIndexed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed, chunksCreated, cancelled: true };
+  };
+
+  let postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   // Auto-build code graph
   progress.phase = "building code graph";
   onProgress?.("Building code dependency graph...");
@@ -1304,6 +1325,9 @@ export async function indexProject(
     logger.warn("Code graph build failed (non-fatal)", { projectPath: resolvedPath, error: graphMsg });
     onProgress?.(`Code graph build failed (non-fatal): ${graphMsg}`);
   }
+
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   // Auto-index context artifacts if .socraticodecontextartifacts.json exists
   try {
@@ -1323,6 +1347,9 @@ export async function indexProject(
     logger.warn("Context artifact indexing failed (non-fatal)", { projectPath: resolvedPath, error: artifactMsg });
     onProgress?.(`Context artifact indexing failed (non-fatal): ${artifactMsg}`);
   }
+
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   onProgress?.(`Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`);
   lastCompleted.set(resolvedPath, {
@@ -1709,22 +1736,44 @@ export async function updateProjectIndex(
     return { added, updated, removed, chunksCreated, cancelled: true };
   }
 
+  // Same post-terminal guard as the full index: the graph, symbol-graph and
+  // context collections are written here, none of them covered by the
+  // reconciliation, so a lock lost during one of these phases must stop the run
+  // rather than carry it through to a success result.
+  const stopIfCancelled = (): {
+    added: number;
+    updated: number;
+    removed: number;
+    chunksCreated: number;
+    cancelled: boolean;
+  } | null => {
+    if (!isCancellationRequested(resolvedPath)) return null;
+    onProgress?.(`Update cancelled during ${progress.phase} (${chunksCreated} chunks saved). The index itself is written; re-run codebase_update to finish the remaining work.`);
+    logger.info("Incremental update cancelled during post-index work", {
+      projectPath: resolvedPath,
+      phase: progress.phase,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  };
+
+  let postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   // Auto-rebuild code graph if any files changed (Phase F).
   //
   // While every changed or removed file requires a complete symbol-graph rebuild,
   // bypass the incremental branch and perform one complete graph rebuild.
-  //
-  // Gated on whether anything the graph is built from actually changed: the
-  // rebuild covers the whole repository, so a change to a file ast-grep cannot
-  // parse would spend that on producing the graph that already exists.
-  const graphAffectingPaths = [
-    ...changedFiles.map((file) => file.relativePath),
-    ...removedRelPaths,
-  ].filter(couldAffectCodeGraph);
-
-  if (graphAffectingPaths.length > 0) {
+  if (added > 0 || updated > 0 || removed > 0) {
     progress.phase = "building code graph";
-    const totalChanged = graphAffectingPaths.length;
+    const totalChanged = changedFiles.length + removedRelPaths.length;
 
     try {
       onProgress?.(
@@ -1740,6 +1789,9 @@ export async function updateProjectIndex(
       onProgress?.(`Code graph build failed (non-fatal): ${graphMsg}`);
     }
   }
+
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   // Auto-index context artifacts if changed (non-fatal)
   try {
@@ -1757,6 +1809,9 @@ export async function updateProjectIndex(
   }
 
   onProgress?.(`Update complete: ${added} added, ${updated} updated, ${removed} removed`);
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   lastCompleted.set(resolvedPath, {
     type: "incremental-update",
     completedAt: Date.now(),

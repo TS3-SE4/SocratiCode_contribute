@@ -28,6 +28,8 @@ let fireOnNextUpsert = false;
 let fireOnNextEmbed = false;
 /** When set, the compromise fires as the terminal `completed` write is issued. */
 let fireOnCompletedUpsert = false;
+/** Fires as the terminal write is issued, without losing the lock. */
+let cancelDuringCompletedUpsert: (() => void) | null = null;
 /**
  * Last metadata payload written, echoed back by `retrieve`, and a count of
  * stored chunk points. Without both, `updateProjectIndex` sees an empty
@@ -82,12 +84,17 @@ vi.mock("@qdrant/js-client-rest", () => ({
         fireOnNextUpsert = false;
         compromise?.(new Error("ENOENT: lock file no longer exists"));
       }
-      if (
-        fireOnCompletedUpsert &&
-        body.points.some((pt) => pt.payload?.indexingStatus === "completed")
-      ) {
+      const isCompletedWrite = body.points.some(
+        (pt) => pt.payload?.indexingStatus === "completed",
+      );
+      if (fireOnCompletedUpsert && isCompletedWrite) {
         fireOnCompletedUpsert = false;
         compromise?.(new Error("ENOENT: lock file no longer exists"));
+      }
+      if (cancelDuringCompletedUpsert && isCompletedWrite) {
+        const cancel = cancelDuringCompletedUpsert;
+        cancelDuringCompletedUpsert = null;
+        cancel();
       }
       for (const p of body.points) {
         const status = p.payload?.indexingStatus;
@@ -124,11 +131,26 @@ vi.mock("../../src/services/embeddings.js", () => ({
   }),
 }));
 
+/** When set, the lock is lost while the graph rebuild is in flight. */
+let fireDuringGraphRebuild = false;
+
 vi.mock("../../src/services/code-graph.js", () => ({
   ensureDynamicLanguages: vi.fn(),
   getAstGrepLang: vi.fn(() => null),
-  rebuildGraph: vi.fn(async () => ({ nodes: [], edges: [] })),
+  rebuildGraph: vi.fn(async () => {
+    if (fireDuringGraphRebuild) {
+      fireDuringGraphRebuild = false;
+      compromise?.(new Error("ENOENT: lock file no longer exists"));
+    }
+    return { nodes: [], edges: [] };
+  }),
   removeGraph: vi.fn(async () => undefined),
+}));
+
+vi.mock("../../src/services/context-artifacts.js", () => ({
+  loadConfig: vi.fn(async () => ({ artifacts: [{ name: "docs" }] })),
+  ensureArtifactsIndexed: vi.fn(async () => ({ reindexed: [], upToDate: [] })),
+  removeAllArtifacts: vi.fn(async () => undefined),
 }));
 
 vi.mock("../../src/services/elixir-templates.js", () => ({
@@ -154,6 +176,8 @@ beforeEach(async () => {
   fireOnNextUpsert = false;
   fireOnNextEmbed = false;
   fireOnCompletedUpsert = false;
+  fireDuringGraphRebuild = false;
+  cancelDuringCompletedUpsert = null;
   lastMetadata = null;
   storedPoints = 0;
   savedStatuses.length = 0;
@@ -283,13 +307,16 @@ describe("indexProject when the lock is lost mid-run", () => {
     expect(savedStatuses).not.toContain("completed");
   });
 
-  it("undoes a completed write when the lock is lost while it is in flight", async () => {
+  it("starts no further metadata write once the lock is known to be lost", async () => {
     // The gate before the write cannot see this: saveProjectMetadata is
     // asynchronous and the compromise arrives from a timer, so cancellation can
-    // land after the check and before the write does. Qdrant has no conditional
-    // write to fence it with, so the collection is repaired instead — another
-    // process may observe `completed` for one round trip, but what remains at
-    // rest is `in-progress`, which is what the next run reconciles from.
+    // land after the check and before the write does.
+    //
+    // Repairing it back to `in-progress` would be wrong here. The lock is gone,
+    // so another process may already have written its own status and hashes,
+    // and a correction from this run would overwrite theirs. Qdrant has no
+    // conditional upsert to tell the two apart after the fact, so the decision
+    // is made before writing: once ownership is lost, stop.
     const indexer = await import("../../src/services/indexer.js");
     const project = await fsp.mkdtemp(path.join(tmp, "late-"));
     await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
@@ -298,10 +325,45 @@ describe("indexProject when the lock is lost mid-run", () => {
     const result = await indexer.indexProject(project);
 
     expect(result.cancelled).toBe(true);
-    // The transient write really happened — otherwise this would be asserting
-    // that the gate caught it early, which is a different case.
+    // The write really did land — otherwise this would be asserting that the
+    // earlier gate caught it, which is a different case.
     expect(savedStatuses).toContain("completed");
-    // What the collection is left holding.
+    // And nothing was written afterwards.
+    expect(savedStatuses.at(-1)).toBe("completed");
+  });
+
+  it("does repair the status when cancelled while the lock is still held", async () => {
+    // The other branch: a user-requested stop leaves this process owning the
+    // lock, so putting the status back is safe and is what lets the next run
+    // reconcile rather than trust a `completed` it should not.
+    const indexer = await import("../../src/services/indexer.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "userstop-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+
+    cancelDuringCompletedUpsert = () => indexer.requestCancellation(project);
+    const result = await indexer.indexProject(project);
+
+    expect(result.cancelled).toBe(true);
     expect(savedStatuses.at(-1)).toBe("in-progress");
+  });
+
+  it("stops at the phase boundary when the lock is lost during the graph rebuild", async () => {
+    // Post-terminal phases write to the graph, symbol-graph and context
+    // collections, none of which the reconciliation covers. Losing the lock in
+    // one of them used to carry on through every remaining phase and then
+    // report success.
+    const indexer = await import("../../src/services/indexer.js");
+    const { ensureArtifactsIndexed } = await import("../../src/services/context-artifacts.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "graphphase-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+
+    fireDuringGraphRebuild = true;
+    const result = await indexer.indexProject(project);
+
+    expect(result.cancelled).toBe(true);
+    // The next phase never started.
+    expect(vi.mocked(ensureArtifactsIndexed)).not.toHaveBeenCalled();
+    // And nothing was written to metadata after the terminal status.
+    expect(savedStatuses.at(-1)).toBe("completed");
   });
 });
