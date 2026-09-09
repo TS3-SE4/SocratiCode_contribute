@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
 /**
- * A failed indexing-status read must abort, not be read as "not interrupted".
+ * A failed indexing-status read must abort the run, not be read as "not
+ * interrupted".
  *
  * The reconciliation gate asks whether the previous run was interrupted. If a
  * transient metadata failure answers "no", the recovery that failure should have
@@ -11,8 +12,11 @@
  * outcome than not running at all.
  *
  * `getProjectMetadata()` cannot be used for that decision: it is explicitly
- * display-oriented and catches every read error to answer `null`. These pin the
- * strict loader's behaviour, and that the indexer aborts rather than advancing.
+ * display-oriented and catches every read error to answer `null`.
+ *
+ * Only the Qdrant client is stubbed. `qdrant.js` and the indexer run for real,
+ * so the second block exercises the actual entry point rather than asserting
+ * against a function that could never have persisted anything.
  */
 
 import fsp from "node:fs/promises";
@@ -20,7 +24,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-let retrieveBehaviour: () => unknown = () => [];
+/** Metadata `retrieve` behaviour, replaced per test. */
+let retrieveBehaviour: (call: number) => unknown = () => [];
+let retrieveCalls = 0;
 const savedStatuses: string[] = [];
 
 vi.mock("../../src/services/logger.js", () => ({
@@ -36,10 +42,22 @@ vi.mock("@qdrant/js-client-rest", () => ({
     async getCollections() {
       return { collections: [{ name: "socraticode_metadata" }] };
     }
+    async getCollection() {
+      return {
+        points_count: 1,
+        status: "green",
+        config: { params: { vectors: { dense: { size: 3, distance: "Cosine" } } } },
+      };
+    }
     async createCollection() {}
     async createPayloadIndex() {}
+    async scroll() {
+      return { points: [], next_page_offset: null };
+    }
+    async delete() {}
     async retrieve() {
-      return retrieveBehaviour();
+      retrieveCalls++;
+      return retrieveBehaviour(retrieveCalls);
     }
     async upsert(_c: string, body: { points: Array<{ payload?: Record<string, unknown> }> }) {
       for (const p of body.points) {
@@ -50,14 +68,63 @@ vi.mock("@qdrant/js-client-rest", () => ({
   },
 }));
 
+vi.mock("../../src/services/embedding-provider.js", () => ({
+  getEmbeddingProvider: vi.fn(async () => ({
+    ensureReady: vi.fn(async () => ({
+      modelPulled: false,
+      containerStarted: false,
+      imagePulled: false,
+    })),
+  })),
+}));
+
+vi.mock("../../src/services/embeddings.js", () => ({
+  prepareDocumentText: vi.fn((content: string) => content),
+  generateEmbeddings: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.1, 0.1])),
+}));
+
+vi.mock("../../src/services/code-graph.js", () => ({
+  ensureDynamicLanguages: vi.fn(),
+  getAstGrepLang: vi.fn(() => null),
+  rebuildGraph: vi.fn(async () => ({ nodes: [], edges: [] })),
+  removeGraph: vi.fn(async () => undefined),
+}));
+
+vi.mock("../../src/services/elixir-templates.js", () => ({
+  analyzeElixirTemplate: vi.fn(() => null),
+  ensureElixirTemplateParsers: vi.fn(async () => undefined),
+  isElixirTemplateExtension: vi.fn(() => false),
+}));
+
+vi.mock("../../src/services/lock.js", () => ({
+  acquireProjectLock: vi.fn(async () => true),
+  releaseProjectLock: vi.fn(async () => undefined),
+}));
+
+vi.mock("../../src/services/symbol-graph-incremental.js", () => ({
+  updateChangedFilesSymbolGraph: vi.fn(async () => ({ updated: 0, removed: 0 })),
+}));
+
+vi.mock("../../src/services/symbol-graph-store.js", () => ({
+  loadSymbolGraphMeta: vi.fn(async () => null),
+}));
+
 const originalEnv = { ...process.env };
 let tmp = "";
 
 beforeEach(async () => {
   vi.resetModules();
   retrieveBehaviour = () => [];
+  retrieveCalls = 0;
   savedStatuses.length = 0;
-  process.env = { ...originalEnv, QDRANT_MODE: "external" };
+  process.env = {
+    ...originalEnv,
+    QDRANT_MODE: "external",
+    EMBEDDING_PROVIDER: "openai",
+    EMBEDDING_MODEL: "test-model",
+    EMBEDDING_DIMENSIONS: "3",
+    EMBEDDING_DOCUMENT_INCLUDE_PATH: "false",
+  };
   tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "socraticode-status-"));
 });
 
@@ -87,7 +154,7 @@ describe("loadIndexingStatus", () => {
   });
 
   it("propagates a transport failure instead of reporting no metadata", async () => {
-    // The whole point: getProjectMetadata() would answer null here, and a caller
+    // The whole point: getProjectMetadata() answers null here, and a caller
     // deciding "was this interrupted?" would read that as "no".
     const { loadIndexingStatus } = await import("../../src/services/qdrant.js");
     retrieveBehaviour = () => {
@@ -111,16 +178,36 @@ describe("loadIndexingStatus", () => {
   });
 });
 
-describe("the reconciliation gate", () => {
-  it("aborts the index rather than advancing it when the status read fails", async () => {
-    const { loadIndexingStatus } = await import("../../src/services/qdrant.js");
-    retrieveBehaviour = () => {
-      throw new Error("connect ECONNREFUSED 127.0.0.1:6333");
+describe("indexProject when the status read fails", () => {
+  it("rejects, and does not persist a completed status over a collection it never repaired", async () => {
+    const indexer = await import("../../src/services/indexer.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "project-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+
+    // Exactly one read fails: the reconciliation gate's, which is the second.
+    // The hash load precedes it and must succeed or the run would abort there;
+    // every read after it must also succeed, or this would pass whether the gate
+    // is strict or lenient — the run would reject either way and the assertion
+    // would prove nothing. With only call 2 failing, a lenient gate swallows the
+    // error, carries on, and persists `completed`; a strict gate aborts.
+    const metadata = [
+      {
+        payload: {
+          projectPath: project,
+          fileHashes: JSON.stringify({ "a.ts": "stale-hash" }),
+          indexingStatus: "in-progress",
+        },
+      },
+    ];
+    retrieveBehaviour = (call) => {
+      if (call === 2) throw new Error("connect ECONNREFUSED 127.0.0.1:6333");
+      return metadata;
     };
 
-    // The gate calls this directly; a rejection propagates out of the index run,
-    // so nothing downstream persists a status for a collection it never repaired.
-    await expect(loadIndexingStatus("codebase_x")).rejects.toThrow();
+    await expect(indexer.indexProject(project)).rejects.toThrow(/ECONNREFUSED/);
+
+    // The damage this guards against: marking an unrepaired index healthy.
     expect(savedStatuses).not.toContain("completed");
+    expect(retrieveCalls).toBeGreaterThanOrEqual(2);
   });
 });
