@@ -23,6 +23,7 @@ import { glob } from "glob";
 import { contextCollectionName, projectIdFromPath } from "../config.js";
 import { CHUNK_OVERLAP, CHUNK_SIZE, DETECT_HEAD_BYTES, MAX_CHUNK_CHARS } from "../constants.js";
 import type { ArtifactIndexState, ContextArtifact, SearchResult } from "../types.js";
+import { continuationId, splitTextToCharCap } from "./chunk-split.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import {
@@ -371,6 +372,13 @@ interface ArtifactChunk {
 /**
  * Chunk artifact content using line-based chunking with overlap.
  * Simple and universal — works for SQL, YAML, Protobuf, Markdown, etc.
+ *
+ * Chunks are cut by line count and then held to a cap counted in characters,
+ * so a window of CHUNK_SIZE lines can exceed it. The overflow is split off into
+ * further chunks rather than dropped: it used to be truncated away, which took
+ * it out of the vector, the payload and the BM25 text alike, and artifacts are
+ * exactly the kind of content that overflows — SQL, YAML and Markdown all run
+ * well past MAX_CHUNK_CHARS / CHUNK_SIZE characters per line.
  */
 export function chunkArtifactContent(
   content: string,
@@ -386,22 +394,30 @@ export function chunkArtifactContent(
 
   for (let start = 0; start < lines.length; start += CHUNK_SIZE - CHUNK_OVERLAP) {
     const end = Math.min(start + CHUNK_SIZE, lines.length);
-    let chunkContent = lines.slice(start, end).join("\n");
-
-    // Apply hard character cap
-    if (chunkContent.length > maxChunkChars) {
-      chunkContent = chunkContent.substring(0, maxChunkChars);
-    }
-
+    const chunkContent = lines.slice(start, end).join("\n");
     const id = generateChunkId(artifactPath, artifactName, start);
 
-    chunks.push({
-      id,
-      content: chunkContent,
-      startLine: start + 1, // 1-based
-      endLine: end,
-      artifactName,
-    });
+    // Text at or below the cap comes back as a single piece, so the common case
+    // is unchanged: one chunk, the parent's own id and line range.
+    const pieces = splitTextToCharCap(chunkContent, maxChunkChars);
+    for (const [index, piece] of pieces.entries()) {
+      // A window that is mostly padding splits into pieces that hold nothing but
+      // whitespace. Each would otherwise cost an embedding call, occupy a point
+      // in Qdrant and compete in search results, so drop them — the same
+      // invariant chunkFileContent holds for code chunks. Dropping is safe: ids
+      // are derived per piece, so removing one never renumbers another.
+      if (piece.text.trim().length === 0) continue;
+      chunks.push({
+        id: index === 0 ? id : continuationId(id, index),
+        content: piece.text,
+        // piece line numbers are 1-based within the window; `start` is the
+        // 0-based index of the window's first line, so adding it maps them onto
+        // the artifact's own 1-based numbering.
+        startLine: start + piece.startLine,
+        endLine: Math.min(start + piece.endLine, end),
+        artifactName,
+      });
+    }
 
     if (end >= lines.length) break;
   }
@@ -950,6 +966,14 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
   if (profileDifferences.length > 0) {
     lines.push(
       `Context index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} pending until a fresh index: ${profileDifferences.join(", ")}`,
+    );
+    // Say what "a fresh index" takes. Re-running the index applies none of
+    // these: an artifact whose content hash and configuration signature are
+    // unchanged is not re-chunked, so one indexed before the character cap
+    // started splitting keeps whatever was truncated out of it. Artifacts are
+    // the content most likely to have overflowed the cap.
+    lines.push(
+      "Context index profile: re-indexing does not apply these — unchanged artifacts are not re-chunked. Run codebase_context_remove, then codebase_context_index.",
     );
   }
   if (effectiveProfile.legacyUnverifiedFields.length > 0) {

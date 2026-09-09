@@ -287,6 +287,16 @@ export async function handleQueryTool(
         statusLines.push(
           `Index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} inactive for this existing index: ${profileDifferences.join(", ")}`,
         );
+        // Say what to do about it. Re-running codebase_index will not apply any
+        // of these: indexing skips files whose content hash is unchanged, so an
+        // existing collection keeps the chunks it already has. Spelling that out
+        // matters most for indexFormatVersion, which says this build would chunk
+        // the same files differently — an index built before the character cap
+        // started splitting instead of truncating is still missing everything
+        // that was truncated away.
+        statusLines.push(
+          "Index profile: re-running codebase_index does not apply these — unchanged files are not re-chunked. Run codebase_remove, then codebase_index.",
+        );
       }
       if (effectiveProfile.legacyUnverifiedFields.length > 0) {
         statusLines.push(

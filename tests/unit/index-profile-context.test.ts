@@ -5,7 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
+import { CURRENT_INDEX_FORMAT_VERSION, type EffectiveIndexProfile } from "../../src/services/index-profile.js";
 import type { ArtifactIndexState } from "../../src/types.js";
 
 let collectionInfo: { pointsCount: number; status: string } | null = null;
@@ -368,7 +368,9 @@ describe("context effective profile compatibility", () => {
     expect(result.reindexed).toEqual(["reference"]);
     expect(savedMetadata.at(-1)?.profile).toMatchObject({
       source: "fresh",
-      indexFormatVersion: 1,
+      // The current format version, whatever it is: this asserts that a fresh
+      // index is stamped with this build's version, not a particular number.
+      indexFormatVersion: CURRENT_INDEX_FORMAT_VERSION,
       queryPrefix: "requested-query: ",
       documentPrefix: "requested-document: ",
       documentIncludesPath: false,
