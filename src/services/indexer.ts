@@ -44,6 +44,7 @@ import {
   ensureCollection,
   getCollectionInfo,
   getProjectMetadata,
+  listIndexedFilePaths,
   loadProjectEffectiveProfile,
   loadProjectHashes,
   saveProjectMetadata,
@@ -169,6 +170,68 @@ async function getProjectHashes(projectId: string, collection: string, resolvedP
     projectHashes.set(projectId, new Map());
   }
   return projectHashes.get(projectId) as Map<string, string>;
+}
+
+/**
+ * Drop hashes for files that have no chunks left in the collection.
+ *
+ * An interrupted run can leave the two out of step. The stored hashes are
+ * checkpointed as `in-progress`, then chunks for files that disappeared are
+ * deleted, and only afterwards is the pruned hash map written back. Stop
+ * between those steps — a crash, a cancellation, a host that exits — and the
+ * collection keeps hashes for points that are gone.
+ *
+ * Nothing recovers from that on its own. The next run reads the file, computes
+ * the same content hash, matches the stale entry and skips it, so the missing
+ * chunks are never rebuilt. `codebase_index` does not help either: it takes the
+ * same skip. Until now the only way back was deleting the collection and
+ * starting over.
+ *
+ * Reconciling the hash map against the points that actually exist turns that
+ * into a self-healing case: a file whose chunks are absent loses its hash, so
+ * the very next run re-indexes it.
+ *
+ * SCOPE — deliberately limited to a resume from `in-progress`.
+ *
+ * This costs one paged scroll of the collection, which is cheap next to
+ * indexing but not free: a repository of ~60k points is ~60 round trips, and a
+ * healthy incremental otherwise finishes in seconds. Running it on every index
+ * would also catch chunk loss from causes other than interruption, and that is
+ * a defensible choice — but it taxes the common path to guard against the rare
+ * one. Interruption is the failure mode with a known mechanism, and it is the
+ * one that is marked in the metadata, so it is what this checks. If loss is
+ * ever observed after a run that completed cleanly, widening this is the
+ * change to make, and the only cost is the scroll.
+ */
+async function reconcileHashesWithStoredPoints(
+  collection: string,
+  hashes: Map<string, string>,
+  projectId: string,
+): Promise<number> {
+  if (hashes.size === 0) return 0;
+
+  const present = await listIndexedFilePaths(collection);
+  // An empty collection is not evidence of loss — a fresh index legitimately has
+  // no points yet, and clearing every hash there would force a full re-embed for
+  // no reason. Only prune when there is something to compare against.
+  if (present.size === 0) return 0;
+
+  let dropped = 0;
+  for (const [relativePath] of hashes) {
+    if (!present.has(relativePath)) {
+      hashes.delete(relativePath);
+      dropped++;
+    }
+  }
+  if (dropped > 0) {
+    logger.info("Reconciled hashes against stored points; files with no chunks will be re-indexed", {
+      projectId,
+      collection,
+      filesRestored: dropped,
+      hashesRemaining: hashes.size,
+    });
+  }
+  return dropped;
 }
 
 /**
@@ -789,6 +852,18 @@ export async function indexProject(
     throw new Error(`Failed to check collection state for ${collection}: ${msg}. Aborting to avoid accidental data loss.`);
   }
   const hasExistingData = existingInfo !== null && existingInfo.pointsCount > 0;
+
+  // Resuming from `in-progress` is the one state where hashes are known to
+  // outlive the chunks they describe, so it is the one state that pays for the
+  // reconciliation scroll. See reconcileHashesWithStoredPoints for why this is
+  // scoped rather than run on every index.
+  if (hasExistingData) {
+    const persisted = await getProjectMetadata(collection);
+    if (persisted?.indexingStatus === "in-progress") {
+      await reconcileHashesWithStoredPoints(collection, hashes, projectId);
+    }
+  }
+
   const storedProfile = existingInfo === null
     ? null
     : await loadProjectEffectiveProfile(collection);
@@ -1190,6 +1265,17 @@ export async function updateProjectIndex(
     onProgress?.("No existing index found, performing full index...");
     const result = await indexProject(projectPath, onProgress, extraExtensions);
     return { added: result.filesIndexed, updated: 0, removed: 0, chunksCreated: result.chunksCreated, cancelled: result.cancelled };
+  }
+
+  // Same reconciliation as indexProject, and needed here for the same reason:
+  // an incremental is what usually runs after an interruption, so this is the
+  // path that would otherwise trust a hash whose chunks are gone and skip the
+  // file forever. Scoped to `in-progress` — see reconcileHashesWithStoredPoints.
+  {
+    const persisted = await getProjectMetadata(collection);
+    if (persisted?.indexingStatus === "in-progress") {
+      await reconcileHashesWithStoredPoints(collection, hashes, projectId);
+    }
   }
 
   if (hashes.size === 0) {

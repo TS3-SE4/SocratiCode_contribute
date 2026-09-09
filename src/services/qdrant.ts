@@ -823,6 +823,47 @@ export async function searchChunksWithFilter(
   }));
 }
 
+/**
+ * Every `relativePath` that currently has at least one point in the collection.
+ *
+ * Exists so a caller can tell "this file is unchanged, skip it" apart from "this
+ * file's chunks are gone". The stored hash map cannot make that distinction on
+ * its own: it records what was hashed, not what survived.
+ *
+ * Pages through with `scroll` rather than `facet` deliberately — facet takes a
+ * limit and offers no cursor, so it cannot enumerate a repository's worth of
+ * paths reliably. Payload is narrowed to the one field and vectors are excluded,
+ * so the cost is one small round trip per `pageSize` points.
+ */
+export async function listIndexedFilePaths(
+  collName: string,
+  pageSize = 1000,
+): Promise<Set<string>> {
+  const qdrant = getClient();
+  const paths = new Set<string>();
+  let offset: string | number | Record<string, unknown> | undefined | null;
+
+  do {
+    const page = await withRetry(
+      () =>
+        qdrant.scroll(collName, {
+          limit: pageSize,
+          with_payload: { include: ["relativePath"] },
+          with_vector: false,
+          ...(offset === undefined || offset === null ? {} : { offset }),
+        }),
+      `listIndexedFilePaths(${collName})`,
+    );
+    for (const point of page.points) {
+      const rel = point.payload?.relativePath;
+      if (typeof rel === "string") paths.add(rel);
+    }
+    offset = page.next_page_offset;
+  } while (offset !== undefined && offset !== null);
+
+  return paths;
+}
+
 /** Get collection info.
  * Returns the collection info if it exists, null if the collection does not exist,
  * or throws an error if the request fails for any other reason (network, timeout, etc.).
