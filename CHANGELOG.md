@@ -4,6 +4,21 @@ All notable changes to SocratiCode are documented here.
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and [Semantic Versioning](https://semver.org/).
 
 
+## [1.13.2](https://github.com/giancarloerra/socraticode/compare/v1.13.1...v1.13.2) (2026-09-09)
+
+### Bug Fixes
+
+* **indexer:** do not mark a file indexed when its upsert was partially skipped ([ff3c06b](https://github.com/giancarloerra/socraticode/commit/ff3c06bbf09784a9bb1bcfdfafd650f9cc2904f7))
+* **indexer:** exclude stranded files with stale hashes from filesIndexed ([388773b](https://github.com/giancarloerra/socraticode/commit/388773b0368bc97815bcd8621a947eab6c61d85a))
+* **indexer:** report files actually indexed, not files walked ([07dd187](https://github.com/giancarloerra/socraticode/commit/07dd18781999d022d5a7293914c02e1e727447bd))
+* **indexer:** report files the index represents, not files walked ([a511f27](https://github.com/giancarloerra/socraticode/commit/a511f27437a45911a984d407f2db4bfd821cc006))
+* **qdrant:** fail the operation when any point is skipped after fallback ([c47a843](https://github.com/giancarloerra/socraticode/commit/c47a843d2065defcb78371cac642c06ab50f8db5))
+
+### Tests
+
+* **helpers:** build the Qdrant test client from the service's getClient() ([27eed85](https://github.com/giancarloerra/socraticode/commit/27eed85aca674e220cd12ae40902c6b184a8db71))
+* reach Qdrant through the service client, not the raw test helper ([a46bc11](https://github.com/giancarloerra/socraticode/commit/a46bc11c903a5d99d1e09ae88bcb0dd5fbbe6fe8))
+
 ## [1.13.1](https://github.com/giancarloerra/socraticode/compare/v1.13.0...v1.13.1) (2026-09-07)
 
 ### Bug Fixes
