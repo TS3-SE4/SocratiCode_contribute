@@ -808,11 +808,49 @@ describe("graph-resolution", () => {
       expect(pyResolve("config", "service-a/main.py", project)).toBeNull();
     });
 
-    it("keeps probing after discarding a self match", () => {
-      // A discarded self match must not end resolution. The legitimate answer
-      // here is reachable ONLY by the manifest-root probe, which runs after
-      // the sibling probe: the project-root and src/ probes both miss, so if
-      // the self match ended the chain the real edge would be lost. `src` is
+    it("does not fall through a src/ self match into lib/", () => {
+      // `src/` is this file's own path entry, so `import mod` from
+      // `src/mod.py` imports that same file; `lib/mod.py` is a different
+      // module CPython never reaches here. Falling through answered with it —
+      // the self-edge traded for a wrong one, exactly what the project-root
+      // probe above refuses to do.
+      project = createTempProject({
+        "src/mod.py": "",
+        "lib/mod.py": "",
+      });
+
+      expect(pyResolve("mod", "src/mod.py", project)).toBeNull();
+      // The lib file still reaches the src module — `src` is probed first, and
+      // only the self match is discarded.
+      expect(pyResolve("mod", "lib/mod.py", project)).toBe("src/mod.py");
+    });
+
+    it("does not fall through a manifest-root self match into a sibling package", () => {
+      // The roots are ordered containing-first, so the root that supplies the
+      // source file is the nearest path entry this file has and every root
+      // behind it belongs to another workspace member. Falling through
+      // answered `import requests` from pkg-a's own `requests.py` with pkg-b's
+      // — a fabricated cross-package edge, worse than the self-edge it
+      // replaced.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-b/pyproject.toml": '[project]\nname = "pkg-b"\n',
+        "packages/pkg-a/src/requests.py": "",
+        "packages/pkg-b/src/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "packages/pkg-a/src/requests.py", project)).toBeNull();
+      expect(pyResolve("requests", "packages/pkg-b/src/requests.py", project)).toBeNull();
+    });
+
+    it("keeps probing after discarding a sibling self match", () => {
+      // A self match discarded by the SIBLING probe must not end resolution —
+      // that probe is a guess at a directory Python may not have on sys.path
+      // at all. The legitimate answer here is reachable ONLY by the
+      // manifest-root probe, which runs after it: the project-root and src/
+      // probes both miss, so if the sibling self match ended the chain the
+      // real edge would be lost. `src` is
       // an import root for pkg-a and `src/ns` is not, so CPython imports
       // packages/pkg-a/src/requests.py for this file.
       project = createTempProject({

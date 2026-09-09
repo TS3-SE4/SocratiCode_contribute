@@ -2574,15 +2574,17 @@ export function resolveImport(
       // (`whisperx.py` doing `import whisperx`), where the true target is the
       // installed distribution and no first-party edge exists at all.
       //
-      // A rejected candidate falls through to the next probe rather than
-      // ending resolution: `src/pkg/requests.py` importing `requests` must
-      // still find a legitimate `src/requests.py` behind the discarded self
-      // match. Only the sibling probe can reach a self match on the layouts in
-      // #157, but `direct` reaches it too for a module at the project root and
-      // the relative branch reaches it for `from . import x` written in a
-      // package's own `__init__.py` — which resolves the bare `.` to that same
-      // `__init__.py`, the commonest self-edge in any Python tree. So the
-      // guard sits on every probe rather than on one of them.
+      // Every probe is guarded, but the disposition differs. The sibling probe
+      // is a guess at a directory Python may not have on `sys.path` at all, so
+      // a self match there falls through to the next probe:
+      // `src/pkg/requests.py` importing `requests` must still find a
+      // legitimate `src/requests.py` behind the discarded match. Every other
+      // absolute probe stands for a real path entry, so a self match there
+      // ends resolution — see the comment above `direct`. The relative branch
+      // has nothing to fall through to: it reaches a self match for
+      // `from . import x` written in a package's own `__init__.py`, which
+      // resolves the bare `.` to that same `__init__.py` — the commonest
+      // self-edge in any Python tree.
       const relSourceFile = toForwardSlash(path.relative(projectPath, sourceFile));
       const notSelf = (candidate: string | null): string | null =>
         candidate === null || candidate === relSourceFile ? null : candidate;
@@ -2600,15 +2602,24 @@ export function resolveImport(
       // Absolute: foo.bar.baz → foo/bar/baz.py or foo/bar/baz/__init__.py
       const modulePath = moduleSpecifier.replace(/\./g, "/");
 
-      // A self match HERE ends resolution rather than falling through. The
-      // project root is ahead of `src/`, `lib/` and every manifest root for a
-      // file that sits at the root — it is that file's own `sys.path[0]` — so
-      // nothing a later probe finds is a module CPython could reach past the
-      // source file itself. Root `mod.py` doing `import mod` beside a
-      // `src/mod.py` imports itself; answering with `src/mod.py` trades the
-      // self-edge for an edge to an unrelated module, which is worse. The
-      // later probes still fall through, because there the discarded match is
-      // a guess (the sibling probe) or one root among several.
+      // A self match at a probe that stands for a real `sys.path` entry ENDS
+      // resolution rather than falling through. Whichever directory a probe
+      // stands for — the project root, `src/`, `lib/`, a manifest-declared
+      // root — a match under it that IS the source file means that directory
+      // is the source file's own path entry, and a path entry that already
+      // supplies the module is not searched past. Root `mod.py` doing
+      // `import mod` beside a `src/mod.py` imports itself; answering with
+      // `src/mod.py` trades the self-edge for an edge to an unrelated module,
+      // which is worse. The same holds one probe down (`src/mod.py` must not
+      // answer with `lib/mod.py`) and at the manifest roots, where the
+      // fall-through reached a *sibling workspace package*:
+      // `packages/pkg-a/src/requests.py` importing `requests` answered with
+      // `packages/pkg-b/src/requests.py`, a fabricated cross-package edge.
+      //
+      // Only the sibling probe still falls through, because it alone is a
+      // guess rather than a path entry: `packages/pkg-a/src/ns/requests.py`
+      // has no `sys.path` entry at `.../src/ns`, so the discarded sibling
+      // match must yield to the declared root that really supplies the module.
       const direct = resolveRelativePath(modulePath, projectPath, projectPath, fileSet, [".py"]);
       if (direct === relSourceFile) return null;
       if (direct) return direct;
@@ -2616,11 +2627,10 @@ export function resolveImport(
       // Try common Python source directories (src layout)
       const pySrcDirs = ["src", "lib"];
       for (const dir of pySrcDirs) {
-        const inSrc = notSelf(
-          resolveRelativePath(
-            path.join(dir, modulePath), projectPath, projectPath, fileSet, [".py"],
-          ),
+        const inSrc = resolveRelativePath(
+          path.join(dir, modulePath), projectPath, projectPath, fileSet, [".py"],
         );
+        if (inSrc === relSourceFile) return null;
         if (inSrc) return inSrc;
       }
 
@@ -2678,6 +2688,13 @@ export function resolveImport(
       // distribution and not the sibling `vendor/requests.py`. Checking only
       // `sourceDir` gated `src/pkg/client.py` while leaving its own
       // subdirectory fabricating the same edge.
+      //
+      // The project root itself counts. Indexing a directory that IS a package
+      // (`.../src/mylib`, `__init__.py` and all) disables the sibling fallback
+      // for the whole tree, and that is right rather than merely intended:
+      // every file in it is a `mylib.*` module reached through the parent
+      // directory on `sys.path`, so the flat guess was never what CPython does
+      // there.
       let inPackage = false;
       for (
         let dir = toForwardSlash(path.relative(projectPath, sourceDir));
@@ -2705,12 +2722,16 @@ export function resolveImport(
       // pythonRootsForFile — a root that is not on the file's ancestor path
       // and not a declared workspace member never appears here, and a package's
       // own root is tried before a sibling package's.
+      //
+      // A self match here ends resolution, like the root and `src/` probes
+      // above: the roots are ordered containing-first, so the root that
+      // supplies the source file itself is the nearest path entry this file
+      // has, and every root behind it belongs to a sibling package.
       for (const importRoot of pythonImportRoots ?? []) {
-        const inRoot = notSelf(
-          resolveRelativePath(
-            path.posix.join(importRoot, modulePath), projectPath, projectPath, fileSet, [".py"],
-          ),
+        const inRoot = resolveRelativePath(
+          path.posix.join(importRoot, modulePath), projectPath, projectPath, fileSet, [".py"],
         );
+        if (inRoot === relSourceFile) return null;
         if (inRoot) return inRoot;
       }
 
