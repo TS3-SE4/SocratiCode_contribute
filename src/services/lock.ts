@@ -55,9 +55,19 @@ function lockFilePath(key: string): string {
  *
  * @param projectPath - Absolute path to the project directory
  * @param operation - Operation type: "index" or "watch"
+ * @param onCompromised - Called if the lock is lost while still held. The lock
+ *   guards a shared collection, so losing it means another process may now be
+ *   writing to what this one is still writing to; the caller is the only thing
+ *   that knows how to stand down. Failures inside the callback are logged and
+ *   swallowed — it runs from proper-lockfile's timer, where a throw has nowhere
+ *   to go.
  * @returns true if the lock was acquired, false if another process holds it
  */
-export async function acquireProjectLock(projectPath: string, operation: string): Promise<boolean> {
+export async function acquireProjectLock(
+  projectPath: string,
+  operation: string,
+  onCompromised?: (err: Error) => void,
+): Promise<boolean> {
   ensureLockDir();
 
   const key = lockKey(projectPath, operation);
@@ -87,6 +97,15 @@ export async function acquireProjectLock(projectPath: string, operation: string)
           error: err.message,
         });
         heldLocks.delete(key);
+        try {
+          onCompromised?.(err);
+        } catch (handlerErr) {
+          logger.warn("Lock compromise handler failed", {
+            projectPath,
+            operation,
+            error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
+          });
+        }
       },
     });
 

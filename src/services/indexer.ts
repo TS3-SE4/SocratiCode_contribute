@@ -137,6 +137,27 @@ export async function getPersistedIndexingStatus(projectPath: string): Promise<"
 
 /** Request graceful cancellation of an in-flight indexing operation.
  *  The operation will stop after the current batch finishes and checkpoint. */
+/**
+ * Stand down when the index lock is lost mid-run.
+ *
+ * The lock is keyed by project id and the collection is shared, so losing it
+ * means another process may now be indexing what this run is still writing to.
+ * Two writers is the state the reconciliation on resume exists to survive; not
+ * racing in the first place is better.
+ *
+ * Cancellation is checked between batches and returns before the terminal
+ * `completed` write, so the collection is left `in-progress` and the next run
+ * reconciles it. That makes standing down safe even when the compromise was
+ * spurious — the cost is one resumable run, against two processes writing to
+ * one collection.
+ */
+function cancelBecauseLockWasLost(projectPath: string): void {
+  logger.warn("Index lock lost while indexing — cancelling to avoid racing the new holder", {
+    projectPath,
+  });
+  requestCancellation(projectPath);
+}
+
 export function requestCancellation(projectPath: string): boolean {
   const resolved = path.resolve(projectPath);
   if (!indexingInProgress.has(resolved)) return false;
@@ -816,7 +837,9 @@ export async function indexProject(
   const resolvedPath = path.resolve(projectPath);
 
   // Cross-process lock: prevent two MCP instances from indexing the same project
-  const lockAcquired = await acquireProjectLock(resolvedPath, "index");
+  const lockAcquired = await acquireProjectLock(resolvedPath, "index", () =>
+    cancelBecauseLockWasLost(resolvedPath),
+  );
   if (!lockAcquired) {
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
@@ -1230,7 +1253,9 @@ export async function updateProjectIndex(
   const resolvedPath = path.resolve(projectPath);
 
   // Cross-process lock: prevent two MCP instances from updating the same project
-  const lockAcquired = await acquireProjectLock(resolvedPath, "index");
+  const lockAcquired = await acquireProjectLock(resolvedPath, "index", () =>
+    cancelBecauseLockWasLost(resolvedPath),
+  );
   if (!lockAcquired) {
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
