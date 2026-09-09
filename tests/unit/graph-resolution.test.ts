@@ -685,9 +685,6 @@ describe("graph-resolution", () => {
   });
 
   describe("sibling-flat fallback scope (#157)", () => {
-    let project: TempProject;
-    afterEach(() => project?.cleanup());
-
     const pyResolve = (spec: string, from: string, p: TempProject) => {
       const manifests = buildPythonManifests(p.root);
       const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
@@ -719,6 +716,24 @@ describe("graph-resolution", () => {
       });
 
       expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
+    });
+
+    it("does not resolve `from . import x` in a package's own __init__.py to itself", () => {
+      // The bare `.` of `from . import mod` names the importing package, and
+      // the file that IS that package is this __init__.py — so the relative
+      // branch answers with the source file. It is the same fabricated
+      // self-edge the absolute probes now discard, and by far the commonest
+      // one in a Python tree; findCircularDependencies has no self-loop guard,
+      // so each one is reported as a cycle. Every other relative form still
+      // resolves.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/mod.py": "",
+      });
+
+      expect(pyResolve(".", "src/pkg/__init__.py", project)).toBeNull();
+      expect(pyResolve(".", "src/pkg/mod.py", project)).toBe("src/pkg/__init__.py");
+      expect(pyResolve(".mod", "src/pkg/__init__.py", project)).toBe("src/pkg/mod.py");
     });
 
     it("does not resolve a file to itself in the #46 layout the fallback serves", () => {

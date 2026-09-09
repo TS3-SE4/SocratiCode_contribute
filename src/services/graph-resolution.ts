@@ -2566,19 +2566,6 @@ export function resolveImport(
     }
 
     case "python": {
-      // Relative: .foo, ..bar
-      if (moduleSpecifier.startsWith(".")) {
-        const dots = moduleSpecifier.match(/^\.+/)?.[0].length ?? 0;
-        let baseDir = sourceDir;
-        for (let i = 1; i < dots; i++) {
-          baseDir = path.dirname(baseDir);
-        }
-        const rest = moduleSpecifier.slice(dots).replace(/\./g, "/");
-        return resolveRelativePath(rest || ".", baseDir, projectPath, fileSet, [".py"]);
-      }
-      // Absolute: foo.bar.baz → foo/bar/baz.py or foo/bar/baz/__init__.py
-      const modulePath = moduleSpecifier.replace(/\./g, "/");
-
       // No import edge from a file to itself (#157). A module that names
       // itself is resolvable in CPython — `import mymodule` inside a
       // top-level `mymodule.py` really does import a second copy — but as a
@@ -2590,12 +2577,28 @@ export function resolveImport(
       // A rejected candidate falls through to the next probe rather than
       // ending resolution: `src/pkg/requests.py` importing `requests` must
       // still find a legitimate `src/requests.py` behind the discarded self
-      // match. Only the sibling probe can reach here on the layouts in #157,
-      // but `direct` reaches it too for a module at the project root, so the
-      // guard sits on every absolute probe rather than on one of them.
+      // match. Only the sibling probe can reach a self match on the layouts in
+      // #157, but `direct` reaches it too for a module at the project root and
+      // the relative branch reaches it for `from . import x` written in a
+      // package's own `__init__.py` — which resolves the bare `.` to that same
+      // `__init__.py`, the commonest self-edge in any Python tree. So the
+      // guard sits on every probe rather than on one of them.
       const relSourceFile = toForwardSlash(path.relative(projectPath, sourceFile));
       const notSelf = (candidate: string | null): string | null =>
         candidate === null || candidate === relSourceFile ? null : candidate;
+
+      // Relative: .foo, ..bar
+      if (moduleSpecifier.startsWith(".")) {
+        const dots = moduleSpecifier.match(/^\.+/)?.[0].length ?? 0;
+        let baseDir = sourceDir;
+        for (let i = 1; i < dots; i++) {
+          baseDir = path.dirname(baseDir);
+        }
+        const rest = moduleSpecifier.slice(dots).replace(/\./g, "/");
+        return notSelf(resolveRelativePath(rest || ".", baseDir, projectPath, fileSet, [".py"]));
+      }
+      // Absolute: foo.bar.baz → foo/bar/baz.py or foo/bar/baz/__init__.py
+      const modulePath = moduleSpecifier.replace(/\./g, "/");
 
       const direct = notSelf(
         resolveRelativePath(modulePath, projectPath, projectPath, fileSet, [".py"]),
