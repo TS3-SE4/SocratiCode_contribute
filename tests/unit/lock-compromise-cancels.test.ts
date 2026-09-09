@@ -26,6 +26,8 @@ let compromise: ((err: Error) => void) | null = null;
 let fireOnNextUpsert = false;
 /** When set, the next embedding batch fires the compromise once. */
 let fireOnNextEmbed = false;
+/** When set, the compromise fires as the terminal `completed` write is issued. */
+let fireOnCompletedUpsert = false;
 /**
  * Last metadata payload written, echoed back by `retrieve`, and a count of
  * stored chunk points. Without both, `updateProjectIndex` sees an empty
@@ -78,6 +80,13 @@ vi.mock("@qdrant/js-client-rest", () => ({
     async upsert(_c: string, body: { points: Array<{ payload?: Record<string, unknown> }> }) {
       if (fireOnNextUpsert) {
         fireOnNextUpsert = false;
+        compromise?.(new Error("ENOENT: lock file no longer exists"));
+      }
+      if (
+        fireOnCompletedUpsert &&
+        body.points.some((pt) => pt.payload?.indexingStatus === "completed")
+      ) {
+        fireOnCompletedUpsert = false;
         compromise?.(new Error("ENOENT: lock file no longer exists"));
       }
       for (const p of body.points) {
@@ -144,6 +153,7 @@ beforeEach(async () => {
   compromise = null;
   fireOnNextUpsert = false;
   fireOnNextEmbed = false;
+  fireOnCompletedUpsert = false;
   lastMetadata = null;
   storedPoints = 0;
   savedStatuses.length = 0;
@@ -271,5 +281,27 @@ describe("indexProject when the lock is lost mid-run", () => {
     expect(result.chunksCreated).toBe(0);
     expect(result.cancelled).toBe(true);
     expect(savedStatuses).not.toContain("completed");
+  });
+
+  it("undoes a completed write when the lock is lost while it is in flight", async () => {
+    // The gate before the write cannot see this: saveProjectMetadata is
+    // asynchronous and the compromise arrives from a timer, so cancellation can
+    // land after the check and before the write does. Qdrant has no conditional
+    // write to fence it with, so the collection is repaired instead — another
+    // process may observe `completed` for one round trip, but what remains at
+    // rest is `in-progress`, which is what the next run reconciles from.
+    const indexer = await import("../../src/services/indexer.js");
+    const project = await fsp.mkdtemp(path.join(tmp, "late-"));
+    await fsp.writeFile(path.join(project, "a.ts"), "export const a = 1;\n");
+
+    fireOnCompletedUpsert = true;
+    const result = await indexer.indexProject(project);
+
+    expect(result.cancelled).toBe(true);
+    // The transient write really happened — otherwise this would be asserting
+    // that the gate caught it early, which is a different case.
+    expect(savedStatuses).toContain("completed");
+    // What the collection is left holding.
+    expect(savedStatuses.at(-1)).toBe("in-progress");
   });
 });

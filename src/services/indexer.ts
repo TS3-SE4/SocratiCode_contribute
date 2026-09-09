@@ -32,6 +32,7 @@ import {
   ensureEffectiveEmbeddingReady,
   profileExtensionLanguageMap,
   resolveEffectiveIndexProfile,
+  type EffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
 import { acquireProjectLock, releaseProjectLock } from "./lock.js";
@@ -189,6 +190,59 @@ function couldAffectCodeGraph(relativePath: string): boolean {
   const ext = path.extname(relativePath);
   if (ext === "") return true;
   return getAstGrepLang(ext) !== null;
+}
+
+/**
+ * Persist the terminal `completed` status, and put it back to `in-progress` if
+ * the lock was lost while that write was in flight.
+ *
+ * The gate before the call cannot close this window on its own:
+ * `saveProjectMetadata` is asynchronous and the compromise callback runs from a
+ * timer, so cancellation can arrive after the check and before the write lands.
+ *
+ * A fence token at the write boundary would be the airtight answer, and Qdrant
+ * does not offer one — a point upsert takes no version precondition, so there
+ * is nothing that could make the write itself refuse once ownership is gone.
+ * What is achievable is to notice and repair. Another process can still observe
+ * `completed` for the length of one round trip, but the collection is left
+ * `in-progress` at rest, and that is what the next run's reconciliation reads.
+ *
+ * Returns whether `completed` stands.
+ */
+async function persistCompletedUnlessLockLost(
+  collection: string,
+  resolvedPath: string,
+  filesTotal: number,
+  filesIndexed: number,
+  hashes: Map<string, string>,
+  effectiveProfile: EffectiveIndexProfile,
+): Promise<boolean> {
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    "completed",
+    effectiveProfile,
+  );
+
+  if (!isCancellationRequested(resolvedPath)) return true;
+
+  logger.warn(
+    "Lock was lost while the completed status was being written — reverting to in-progress so the next run reconciles",
+    { projectPath: resolvedPath, collection },
+  );
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+  return false;
 }
 
 /** Check whether cancellation has been requested for a project */
@@ -1218,15 +1272,26 @@ export async function indexProject(
 
   // Final metadata save
   progress.phase = "saving metadata";
-  await saveProjectMetadata(
+  const completedStands = await persistCompletedUnlessLockLost(
     collection,
     resolvedPath,
     filesTotal,
     filesIndexed,
     hashes,
-    "completed",
     effectiveProfile,
   );
+  if (!completedStands) {
+    onProgress?.(`Indexing cancelled while completing (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
+  }
 
   // Auto-build code graph
   progress.phase = "building code graph";
@@ -1623,15 +1688,26 @@ export async function updateProjectIndex(
   }
 
   // Persist updated hashes
-  await saveProjectMetadata(
+  const completedStands = await persistCompletedUnlessLockLost(
     collection,
     resolvedPath,
     currentFiles.length,
     hashes.size,
     hashes,
-    "completed",
     effectiveProfile,
   );
+  if (!completedStands) {
+    onProgress?.(`Update cancelled while completing (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  }
 
   // Auto-rebuild code graph if any files changed (Phase F).
   //
