@@ -7,14 +7,26 @@
  * and infrastructure readiness cache resets.
  */
 
-import { QdrantClient } from "@qdrant/js-client-rest";
-import { QDRANT_HOST, QDRANT_PORT } from "../../src/constants.js";
+import type { QdrantClient } from "@qdrant/js-client-rest";
+import { getClient } from "../../src/services/qdrant.js";
 
 /**
- * Create a Qdrant client for test cleanup operations.
+ * Qdrant client for test setup and cleanup.
+ *
+ * Reuses the service's own `getClient()` rather than constructing
+ * `@qdrant/js-client-rest` here. Building one locally duplicated the URL,
+ * API-key and `checkCompatibility` configuration, and — the reason this
+ * changed — skipped `ensureQdrantClientCompatibility()`, the transport bridge
+ * the pinned 1.18 client needs on Node 26. Without it every request fails with
+ * `UND_ERR_INVALID_ARG: invalid onError method`, and `waitForQdrant()` retries
+ * that real client error until it reports a perfectly healthy Qdrant as
+ * unreachable.
+ *
+ * `checkCompatibility: false` is not a substitute: it silences the version
+ * probe without installing the bridge, so the requests still fail.
  */
 export function createTestQdrantClient(): QdrantClient {
-  return new QdrantClient({ host: QDRANT_HOST, port: QDRANT_PORT });
+  return getClient();
 }
 
 /**

@@ -1022,7 +1022,9 @@ export async function indexProject(
       },
     }));
 
-    const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+    // Throws if any point failed after the per-point fallback, so hashes below
+    // are only advanced for a batch that landed in full.
+    await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
       // Enrich the error with batch context for debugging
       const fileList = fileBatch.map((f) => f.relativePath).join(", ");
       const msg = err instanceof Error ? err.message : String(err);
@@ -1032,14 +1034,6 @@ export async function indexProject(
         `Files in batch: ${fileList}`
       );
     });
-
-    if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-      // Every single point in the batch was skipped — the collection likely disappeared
-      throw new Error(
-        `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-        `were skipped (collection=${collection}). The collection may have been deleted externally.`
-      );
-    }
 
     // Update hashes for this batch's files
     for (const file of fileBatch) {
@@ -1062,7 +1056,15 @@ export async function indexProject(
     onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
   }
 
-  const filesIndexed = files.length;
+  // filesTotal is everything the walk found; filesIndexed is what the index
+  // actually represents. They differ whenever a file was skipped before
+  // chunking — oversized, or unreadable — so the walked count would overstate
+  // the result. hashes.size is authoritative: oversized paths are excluded from
+  // currentFileSet above and pruned from hashes, and unreadable files never get
+  // an entry. Reaching here means every batch landed in full, since a partial
+  // upsert throws, so no stale entry can inflate it either.
+  const filesTotal = files.length;
+  const filesIndexed = hashes.size;
   const chunksCreated = totalChunksCreated;
 
   // Final metadata save
@@ -1070,8 +1072,8 @@ export async function indexProject(
   await saveProjectMetadata(
     collection,
     resolvedPath,
+    filesTotal,
     filesIndexed,
-    hashes.size,
     hashes,
     "completed",
     effectiveProfile,
@@ -1398,14 +1400,9 @@ export async function updateProjectIndex(
         },
       }));
 
-      const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints);
-
-      if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-        throw new Error(
-          `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-          `were skipped (collection=${collection}). The collection may have been deleted externally.`
-        );
-      }
+      // Throws if any point failed after the per-point fallback, so hashes below
+      // are only advanced for a batch that landed in full.
+      await upsertPreEmbeddedChunks(collection, batchPoints);
 
       // Update hashes and counts for this batch's files
       for (const file of fileBatch) {

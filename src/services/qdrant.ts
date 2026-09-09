@@ -355,7 +355,16 @@ const MAX_BM25_TEXT_CHARS = 32_000; // ~32KB
 
 /** Upsert pre-embedded points into a collection (no embedding generation).
  * bm25Text is forwarded to Qdrant's server-side BM25 inference (truncated if too long).
- * Returns the number of points that were skipped due to upsert errors. */
+ *
+ * A failing batch is retried point by point to isolate the bad point(s). If any
+ * point still fails, this throws: a partial write must fail the whole indexing
+ * operation.
+ *
+ * Callers must not treat a partial write as success. A re-indexed file has its
+ * previous chunks deleted before this call, so recording it as indexed after a
+ * partial failure strands it at zero chunks with a content hash that suppresses
+ * every future re-index. Throwing leaves stored hashes and earlier checkpoints
+ * untouched, so the next index or update retries the file naturally. */
 export async function upsertPreEmbeddedChunks(
   collectionName: string,
   points: Array<{
@@ -364,8 +373,8 @@ export async function upsertPreEmbeddedChunks(
     bm25Text: string;
     payload: Record<string, unknown>;
   }>,
-): Promise<{ pointsSkipped: number }> {
-  if (points.length === 0) return { pointsSkipped: 0 };
+): Promise<void> {
+  if (points.length === 0) return;
 
   const qdrant = getClient();
   const namedPoints = points.map((p) => ({
@@ -383,6 +392,7 @@ export async function upsertPreEmbeddedChunks(
   }));
 
   let totalSkipped = 0;
+  const skippedPaths = new Set<string>();
 
   // Upsert in batches of 100, with per-point fallback on failure
   for (let i = 0; i < namedPoints.length; i += 100) {
@@ -406,6 +416,11 @@ export async function upsertPreEmbeddedChunks(
         } catch (pointErr) {
           skipped++;
           const filePath = point.payload?.relativePath ?? point.payload?.filePath ?? point.id;
+          // Record the owning file so the caller can leave its hash untouched
+          // and re-index it on the next pass.
+          if (typeof point.payload?.relativePath === "string") {
+            skippedPaths.add(point.payload.relativePath);
+          }
           logger.warn(`Skipping point that failed upsert`, {
             pointId: point.id,
             filePath: String(filePath),
@@ -420,7 +435,17 @@ export async function upsertPreEmbeddedChunks(
     }
   }
 
-  return { pointsSkipped: totalSkipped };
+  if (totalSkipped > 0) {
+    const affected = [...skippedPaths].sort();
+    const shown = affected.slice(0, 10).join(", ");
+    const more = affected.length > 10 ? `, and ${affected.length - 10} more` : "";
+    throw new Error(
+      `Qdrant upsert incomplete for collection=${collectionName}: ` +
+      `${totalSkipped}/${points.length} point(s) failed after per-point retry. ` +
+      `Affected files: ${shown}${more}. ` +
+      `Nothing has been recorded as indexed; re-run the index once Qdrant is healthy.`,
+    );
+  }
 }
 
 /** Delete all chunks for a specific file (matched by relativePath) */
