@@ -29,12 +29,13 @@ import { detectExtensionFromSource, resolveExtensionlessExtension } from "./exte
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import {
   documentTextProfile,
+  type EffectiveIndexProfile,
   ensureEffectiveEmbeddingReady,
   profileExtensionLanguageMap,
   resolveEffectiveIndexProfile,
   withEffectiveEmbedding,
 } from "./index-profile.js";
-import { acquireProjectLock, releaseProjectLock } from "./lock.js";
+import { acquireProjectLock, holdsProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import {
   type CollectionInfo,
@@ -143,6 +144,95 @@ export function requestCancellation(projectPath: string): boolean {
   cancellationRequested.set(resolved, true);
   logger.info("Cancellation requested — will stop after current batch", { projectPath: resolved });
   return true;
+}
+
+/**
+ * Stand down when the index lock is lost mid-run.
+ *
+ * The lock is keyed by project id and the collection is shared, so losing it
+ * means another process may now be indexing what this run is still writing to.
+ * Two writers is the state the reconciliation on resume exists to survive; not
+ * racing in the first place is better.
+ *
+ * Cancellation is checked between batches and returns before the terminal
+ * `completed` write, so the collection is left `in-progress` and the next run
+ * reconciles it. That makes standing down safe even when the compromise was
+ * spurious — the cost is one resumable run, against two processes writing to
+ * one collection.
+ *
+ * `requestCancellation` no-ops if the run is not registered yet, which cannot
+ * happen here: registration follows the lock acquisition with no `await`
+ * between them, and this runs from proper-lockfile's timer, which cannot fire
+ * during synchronous execution.
+ */
+function cancelBecauseLockWasLost(projectPath: string): void {
+  logger.warn("Index lock lost while indexing — cancelling to avoid racing the new holder", {
+    projectPath,
+  });
+  requestCancellation(projectPath);
+}
+
+/**
+ * Persist the terminal `completed` status, and undo it only while this process
+ * still owns the project lock.
+ *
+ * The gate before the call cannot close the window on its own:
+ * `saveProjectMetadata` is asynchronous and a compromise arrives from
+ * proper-lockfile's timer, so cancellation can land after the check and before
+ * the write does.
+ *
+ * The repair is therefore conditional on ownership rather than on cancellation
+ * alone. A user-requested stop leaves the lock held, so the status can safely be
+ * put back. A lost lock means another process may already have written its own
+ * status and hashes, and correcting ours would overwrite theirs — so once
+ * ownership is known to be gone, no further write is started at all. Qdrant
+ * offers no conditional upsert to distinguish the two after the fact, which is
+ * exactly why the decision is made before writing rather than after.
+ *
+ * Returns whether `completed` stands.
+ */
+async function persistCompletedUnlessLockLost(
+  collection: string,
+  resolvedPath: string,
+  filesTotal: number,
+  filesIndexed: number,
+  hashes: Map<string, string>,
+  effectiveProfile: EffectiveIndexProfile,
+): Promise<boolean> {
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    "completed",
+    effectiveProfile,
+  );
+
+  if (!isCancellationRequested(resolvedPath)) return true;
+
+  if (!holdsProjectLock(resolvedPath, "index")) {
+    logger.warn(
+      "Cancelled while completing and the lock is no longer held — leaving metadata alone rather than overwriting the new holder",
+      { projectPath: resolvedPath, collection },
+    );
+    return false;
+  }
+
+  logger.warn("Cancelled while the completed status was being written — reverting to in-progress", {
+    projectPath: resolvedPath,
+    collection,
+  });
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+  return false;
 }
 
 /** Check whether cancellation has been requested for a project */
@@ -816,7 +906,9 @@ export async function indexProject(
   const resolvedPath = path.resolve(projectPath);
 
   // Cross-process lock: prevent two MCP instances from indexing the same project
-  const lockAcquired = await acquireProjectLock(resolvedPath, "index");
+  const lockAcquired = await acquireProjectLock(resolvedPath, "index", () =>
+    cancelBecauseLockWasLost(resolvedPath),
+  );
   if (!lockAcquired) {
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
@@ -1148,17 +1240,79 @@ export async function indexProject(
   const filesIndexed = hashes.size;
   const chunksCreated = totalChunksCreated;
 
+  // The batch loop's check cannot see a cancellation that arrives during the
+  // final batch, and a run with no batches never reaches it at all. Either way
+  // the flag would be set and never read, and this transition would then tell
+  // the next run the collection is healthy — suppressing the reconciliation
+  // that repairs it. The checkpoints above already persisted `in-progress`, so
+  // returning here leaves the collection recoverable.
+  if (isCancellationRequested(resolvedPath)) {
+    onProgress?.(`Indexing cancelled before completion (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
+    logger.info("Indexing cancelled before the completed transition", { projectPath: resolvedPath, chunksIndexed: chunksCreated });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
+  }
+
   // Final metadata save
   progress.phase = "saving metadata";
-  await saveProjectMetadata(
+  const completedStands = await persistCompletedUnlessLockLost(
     collection,
     resolvedPath,
     filesTotal,
     filesIndexed,
     hashes,
-    "completed",
     effectiveProfile,
   );
+  if (!completedStands) {
+    onProgress?.(`Indexing cancelled while completing (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
+  }
+
+  // Post-terminal phases are long, asynchronous, and write to collections the
+  // reconciliation does not cover — the code graph, the symbol graph and the
+  // context artifacts. A lock lost during any of them leaves this process
+  // writing to a project it no longer owns, and previously the run carried on
+  // through every remaining phase and then reported success. Check between
+  // phases and stop instead.
+  const stopIfCancelled = (): {
+    filesIndexed: number;
+    chunksCreated: number;
+    cancelled: boolean;
+  } | null => {
+    if (!isCancellationRequested(resolvedPath)) return null;
+    onProgress?.(`Indexing cancelled during ${progress.phase} (${chunksCreated} chunks saved). The index itself is written; re-run codebase_index to finish the remaining work.`);
+    logger.info("Indexing cancelled during post-index work", {
+      projectPath: resolvedPath,
+      phase: progress.phase,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: filesIndexed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed, chunksCreated, cancelled: true };
+  };
+
+  let postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   // Auto-build code graph
   progress.phase = "building code graph";
@@ -1172,9 +1326,19 @@ export async function indexProject(
     onProgress?.(`Code graph build failed (non-fatal): ${graphMsg}`);
   }
 
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   // Auto-index context artifacts if .socraticodecontextartifacts.json exists
   try {
     const artifactConfig = await loadConfig(resolvedPath);
+    // Ownership can be lost while loadConfig is pending, and this run would
+    // then start a fresh write to the context collection for a project it no
+    // longer owns. The gate before this phase cannot see that, so check again
+    // once the await has resolved and before anything is written.
+    postIndexCancelled = stopIfCancelled();
+    if (postIndexCancelled) return postIndexCancelled;
+
     if (artifactConfig?.artifacts?.length) {
       progress.phase = "indexing context artifacts";
       onProgress?.(`Indexing ${artifactConfig.artifacts.length} context artifact${artifactConfig.artifacts.length === 1 ? "" : "s"}...`);
@@ -1190,6 +1354,9 @@ export async function indexProject(
     logger.warn("Context artifact indexing failed (non-fatal)", { projectPath: resolvedPath, error: artifactMsg });
     onProgress?.(`Context artifact indexing failed (non-fatal): ${artifactMsg}`);
   }
+
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   onProgress?.(`Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`);
   lastCompleted.set(resolvedPath, {
@@ -1230,7 +1397,9 @@ export async function updateProjectIndex(
   const resolvedPath = path.resolve(projectPath);
 
   // Cross-process lock: prevent two MCP instances from updating the same project
-  const lockAcquired = await acquireProjectLock(resolvedPath, "index");
+  const lockAcquired = await acquireProjectLock(resolvedPath, "index", () =>
+    cancelBecauseLockWasLost(resolvedPath),
+  );
   if (!lockAcquired) {
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
@@ -1533,16 +1702,77 @@ export async function updateProjectIndex(
     }
   }
 
+  // Same terminal gate as the full index, and it matters more here: the removal
+  // loop above deletes chunks, and the batch loop is skipped entirely when
+  // nothing changed, so a cancellation can arrive with no later check to read
+  // it. Persisting `completed` over a half-removed collection is precisely the
+  // state the reconciliation on resume exists to repair.
+  if (isCancellationRequested(resolvedPath)) {
+    onProgress?.(`Update cancelled before completion (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
+    logger.info("Incremental update cancelled before the completed transition", { projectPath: resolvedPath, chunksCreated });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  }
+
   // Persist updated hashes
-  await saveProjectMetadata(
+  const completedStands = await persistCompletedUnlessLockLost(
     collection,
     resolvedPath,
     currentFiles.length,
     hashes.size,
     hashes,
-    "completed",
     effectiveProfile,
   );
+  if (!completedStands) {
+    onProgress?.(`Update cancelled while completing (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  }
+
+  // Same post-terminal guard as the full index: the graph, symbol-graph and
+  // context collections are written here, none of them covered by the
+  // reconciliation, so a lock lost during one of these phases must stop the run
+  // rather than carry it through to a success result.
+  const stopIfCancelled = (): {
+    added: number;
+    updated: number;
+    removed: number;
+    chunksCreated: number;
+    cancelled: boolean;
+  } | null => {
+    if (!isCancellationRequested(resolvedPath)) return null;
+    onProgress?.(`Update cancelled during ${progress.phase} (${chunksCreated} chunks saved). The index itself is written; re-run codebase_update to finish the remaining work.`);
+    logger.info("Incremental update cancelled during post-index work", {
+      projectPath: resolvedPath,
+      phase: progress.phase,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  };
+
+  let postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   // Auto-rebuild code graph if any files changed (Phase F).
   //
@@ -1567,9 +1797,19 @@ export async function updateProjectIndex(
     }
   }
 
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   // Auto-index context artifacts if changed (non-fatal)
   try {
     const artifactConfig = await loadConfig(resolvedPath);
+    // Ownership can be lost while loadConfig is pending, and this run would
+    // then start a fresh write to the context collection for a project it no
+    // longer owns. The gate before this phase cannot see that, so check again
+    // once the await has resolved and before anything is written.
+    postIndexCancelled = stopIfCancelled();
+    if (postIndexCancelled) return postIndexCancelled;
+
     if (artifactConfig?.artifacts?.length) {
       progress.phase = "indexing context artifacts";
       const result = await ensureArtifactsIndexed(resolvedPath);
@@ -1582,7 +1822,11 @@ export async function updateProjectIndex(
     logger.warn("Context artifact indexing failed during incremental update (non-fatal)", { projectPath: resolvedPath, error: artifactMsg });
   }
 
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   onProgress?.(`Update complete: ${added} added, ${updated} updated, ${removed} removed`);
+
   lastCompleted.set(resolvedPath, {
     type: "incremental-update",
     completedAt: Date.now(),
