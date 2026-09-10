@@ -168,9 +168,16 @@ npm run release:dry
 This will automatically:
 1. Determine the version bump from your commits
 2. Update `CHANGELOG.md` with all `feat:`, `fix:`, etc. entries
-3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, and VS Code extension package files
-4. Create a git commit and tag (`v1.1.0`)
-5. Push to GitHub and create a GitHub Release
+3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, VS Code extension package files, and `server.json`
+4. Publish the npm package
+5. Create and push a git commit and tag (`v1.1.0`), then create a GitHub Release
+6. Publish matching VS Code, Open VSX, and official MCP Registry entries from the tag workflows
+
+The MCP Registry workflow verifies that the tag, root package, and every release
+manifest carry the same version, waits for that exact npm package to become
+available, validates `server.json`, and publishes with GitHub OIDC. It uses no
+long-lived Registry credential. A failure stops the Registry job and leaves the
+underlying npm and GitHub release visible for diagnosis and a workflow rerun.
 
 ---
 
@@ -1618,9 +1625,10 @@ npm run publish:all
 
 The shipped integrations track the engine version. The
 `scripts/bump-plugin-versions.mjs` `release-it` hook updates every plugin
-manifest, `gemini-extension.json`, `extension/package.json`, and both version
-fields in `extension/package-lock.json`. An engine release `vX.Y.Z` therefore
-publishes matching integration metadata.
+manifest, `gemini-extension.json`, `extension/package.json`, both version fields
+in `extension/package-lock.json`, and both the server and npm-package versions
+in `server.json`. An engine release `vX.Y.Z` therefore publishes matching
+integration and MCP Registry metadata.
 
 ### What the extension does NOT do
 
