@@ -58,6 +58,18 @@ describe("graph-resolution", () => {
     project = null;
   });
 
+  // Python resolution as the graph builder calls it: manifests discovered from
+  // the tree, roots scoped to the importing file. Shared by every Python
+  // describe below so the probe order under test is the production one.
+  const pyResolve = (spec: string, from: string, p: TempProject) => {
+    const manifests = buildPythonManifests(p.root);
+    const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
+    return resolveImport(
+      spec, path.join(p.root, from), p.root, p.fileSet, "python",
+      undefined, undefined, undefined, undefined, undefined, undefined, roots,
+    );
+  };
+
   describe("TypeScript/JavaScript resolution", () => {
     it("resolves relative imports with .js extension to .ts files", () => {
       project = createTempProject({
@@ -387,25 +399,6 @@ describe("graph-resolution", () => {
     // on: the roots the pyproject.toml manifests declare, scoped to the
     // importing file and tried nearest first.
 
-    const pyResolve = (spec: string, from: string, p: TempProject) => {
-      const manifests = buildPythonManifests(p.root);
-      const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
-      return resolveImport(
-        spec,
-        path.join(p.root, from),
-        p.root,
-        p.fileSet,
-        "python",
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        roots,
-      );
-    };
-
     // The reporter's layout: dashed distribution directory, intervening src/,
     // underscored module name — a three-way mismatch no name-shaped guess
     // can bridge. The root manifest declares the members, which is what puts
@@ -663,6 +656,177 @@ describe("graph-resolution", () => {
       });
 
       expect(pyResolve("os", "src/pkg_a/main.py", project)).toBeNull();
+    });
+  });
+
+  describe("sibling-flat fallback scope (#157)", () => {
+    it("does not resolve a file to itself", () => {
+      // The first-party module named after the package it wraps. No Python
+      // import produces a dependency on the importing file.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
+    });
+
+    it("does not resolve `from . import x` in a package's own __init__.py to itself", () => {
+      // The bare `.` of `from . import mod` names the importing package, and
+      // the file that IS that package is this __init__.py — so the relative
+      // branch answers with the source file. It is the same fabricated
+      // self-edge the absolute probes now discard, and by far the commonest
+      // one in a Python tree; findCircularDependencies has no self-loop guard,
+      // so each one is reported as a cycle. Every other relative form still
+      // resolves.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/mod.py": "",
+      });
+
+      expect(pyResolve(".", "src/pkg/__init__.py", project)).toBeNull();
+      expect(pyResolve(".", "src/pkg/mod.py", project)).toBe("src/pkg/__init__.py");
+      expect(pyResolve(".mod", "src/pkg/__init__.py", project)).toBe("src/pkg/mod.py");
+    });
+
+    it("does not resolve a file to itself in the #46 layout the fallback serves", () => {
+      // No __init__.py, so the sibling fallback still applies here and must:
+      // `import config` keeps resolving. Only the self match is discarded,
+      // which no package gate could reach — the two guards are independent.
+      project = createTempProject({
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+        "service-a/requests.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBe("service-a/config.py");
+      expect(pyResolve("requests", "service-a/requests.py", project)).toBeNull();
+    });
+
+    it("leaves a non-self collision resolved — execution-mode ambiguity", () => {
+      // Which file CPython loads for `import requests` here depends on how
+      // mod.py is run, and the tree does not say: imported as `ns.sub.mod` the
+      // installed distribution wins, executed as `python src/ns/sub/mod.py`
+      // the sibling does. Pinned as a decision rather than an oversight — the
+      // resolver has no evidence of execution mode, so it does not guess.
+      // Only the unambiguous self-resolution is removed.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "ns-demo"\n',
+        "src/ns/sub/mod.py": "",
+        "src/ns/sub/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/ns/sub/mod.py", project)).toBe("src/ns/sub/requests.py");
+      expect(pyResolve("requests", "src/ns/sub/requests.py", project)).toBeNull();
+    });
+
+    it("keeps the #46 sibling edge when the service directory also has __init__.py", () => {
+      // `sys.path[0]` is the SCRIPT's directory whether or not that directory
+      // is also a package, so `python service-a/main.py` really does import
+      // service-a/config.py here. Gating the sibling probe on __init__.py
+      // would drop this legitimate #46 edge on a layout the tree cannot
+      // distinguish from a package module — a backward-compatibility
+      // regression, so it is not done.
+      project = createTempProject({
+        "service-a/__init__.py": "",
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBe("service-a/config.py");
+    });
+
+    it("leaves a regular-package name collision resolved — execution-mode ambiguity", () => {
+      // The #157 report's own case, left alone on purpose. `import requests`
+      // from src/pkg/client.py loads the installed distribution when the file
+      // is reached as `pkg.client`, and the sibling when it is executed
+      // directly; __init__.py does not settle which, because sys.path[0]
+      // follows the invocation, not the layout. Documented rather than
+      // changed. Narrowing it needs evidence of execution mode the resolver
+      // does not have.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/client.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/client.py", project)).toBe("src/pkg/requests.py");
+      // The self-edge in the same tree is still unambiguous, and still goes.
+      expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
+    });
+
+    it("does not fall through a project-root self match into src/", () => {
+      // The root IS sys.path[0] for a file that sits there, so `import mod`
+      // from `mod.py` imports that same file — no later probe can name a
+      // module CPython would reach instead. Falling through answered with
+      // `src/mod.py`, an edge to an unrelated module: the self-edge traded for
+      // a wrong one rather than removed.
+      project = createTempProject({
+        "mod.py": "",
+        "src/mod.py": "",
+      });
+
+      expect(pyResolve("mod", "mod.py", project)).toBeNull();
+      // The src-layout file still reaches the root module; only the self
+      // match is discarded.
+      expect(pyResolve("mod", "src/mod.py", project)).toBe("mod.py");
+    });
+
+    it("does not fall through a src/ self match into lib/", () => {
+      // `src/` is this file's own path entry, so `import mod` from
+      // `src/mod.py` imports that same file; `lib/mod.py` is a different
+      // module CPython never reaches here. Falling through answered with it —
+      // the self-edge traded for a wrong one, exactly what the project-root
+      // probe above refuses to do.
+      project = createTempProject({
+        "src/mod.py": "",
+        "lib/mod.py": "",
+      });
+
+      expect(pyResolve("mod", "src/mod.py", project)).toBeNull();
+      // The lib file still reaches the src module — `src` is probed first, and
+      // only the self match is discarded.
+      expect(pyResolve("mod", "lib/mod.py", project)).toBe("src/mod.py");
+    });
+
+    it("does not fall through a manifest-root self match into a sibling package", () => {
+      // The roots are ordered containing-first, so the root that supplies the
+      // source file is the nearest path entry this file has and every root
+      // behind it belongs to another workspace member. Falling through
+      // answered `import requests` from pkg-a's own `requests.py` with pkg-b's
+      // — a fabricated cross-package edge, worse than the self-edge it
+      // replaced.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-b/pyproject.toml": '[project]\nname = "pkg-b"\n',
+        "packages/pkg-a/src/requests.py": "",
+        "packages/pkg-b/src/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "packages/pkg-a/src/requests.py", project)).toBeNull();
+      expect(pyResolve("requests", "packages/pkg-b/src/requests.py", project)).toBeNull();
+    });
+
+    it("keeps probing after discarding a sibling self match", () => {
+      // A self match discarded by the SIBLING probe must not end resolution —
+      // that probe is a guess at a directory Python may not have on sys.path
+      // at all. The legitimate answer here is reachable ONLY by the
+      // manifest-root probe, which runs after it: the project-root and src/
+      // probes both miss, so if the sibling self match ended the chain the
+      // real edge would be lost. `src` is
+      // an import root for pkg-a and `src/ns` is not, so CPython imports
+      // packages/pkg-a/src/requests.py for this file.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/requests.py": "",
+        "packages/pkg-a/src/ns/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "packages/pkg-a/src/ns/requests.py", project)).toBe(
+        "packages/pkg-a/src/requests.py",
+      );
     });
   });
 
