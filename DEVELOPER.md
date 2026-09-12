@@ -168,9 +168,16 @@ npm run release:dry
 This will automatically:
 1. Determine the version bump from your commits
 2. Update `CHANGELOG.md` with all `feat:`, `fix:`, etc. entries
-3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, and VS Code extension package files
-4. Create a git commit and tag (`v1.1.0`)
-5. Push to GitHub and create a GitHub Release
+3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, VS Code extension package files, and `server.json`
+4. Publish the npm package
+5. Create and push a git commit and tag (`v1.1.0`), then create a GitHub Release
+6. Publish matching VS Code, Open VSX, and official MCP Registry entries from the tag workflows
+
+The MCP Registry workflow verifies that the tag, root package, and every release
+manifest carry the same version, waits for that exact npm package to become
+available, validates `server.json`, and publishes with GitHub OIDC. It uses no
+long-lived Registry credential. A failure stops the Registry job and leaves the
+underlying npm and GitHub release visible for diagnosis and a workflow rerun.
 
 ---
 
@@ -240,7 +247,7 @@ All constants are defined in `src/constants.ts`:
 | `CHUNK_OVERLAP` | `10` | Overlapping lines between chunks cut by line count — adjacent AST declaration chunks do not overlap |
 | `MAX_FILE_BYTES` | `5 MB` | Max file size before skipping (env-configurable via `MAX_FILE_SIZE_MB`) |
 | `MAX_AVG_LINE_LENGTH` | `500` | Avg line length above which character-based chunking is used (minified files) |
-| `MAX_CHUNK_CHARS` | `2000` | Hard character limit per chunk (provider-level safety net, env-configurable via `MAX_CHUNK_CHARS`) |
+| `MAX_CHUNK_CHARS` | `2000` | Character limit per chunk, and on a format-2 collection the boundary an over-long chunk is split at (env-configurable via `MAX_CHUNK_CHARS`) |
 | `QDRANT_PORT` | `16333` | Qdrant HTTP API port (host-side) |
 | `QDRANT_GRPC_PORT` | `16334` | Qdrant gRPC port (host-side) |
 | `QDRANT_CONTAINER_NAME` | `socraticode-qdrant` | Docker container name |
@@ -378,8 +385,9 @@ When `codebase_index` is called:
    │   │   ├── Small declarations merged, large ones sub-chunked
    │   │   └── Preamble (imports) and epilogue handled separately
    │   └── Line-based fallback: 100-line segments with 10-line overlap
-   ├── Hard character cap (`MAX_CHUNK_CHARS`, default 2000 chars) applied to all chunks
+   ├── Character cap (`MAX_CHUNK_CHARS`, default 2000 chars): on a format-2 collection a chunk over the cap is split, not truncated
    ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
+   │   └── A piece split off by the cap is seeded from its parent's ID instead
    └── Detect language from file extension
 
 6. BATCHED EMBEDDING + UPSERT (50 files per batch)
@@ -1355,7 +1363,7 @@ Behaviour:
 
 ```typescript
 interface FileChunk {
-  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12)
+  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12); a piece split off by the cap is seeded from its parent's ID
   filePath: string;      // Absolute path
   relativePath: string;  // Relative to project root
   content: string;       // Chunk text content
@@ -1618,9 +1626,10 @@ npm run publish:all
 
 The shipped integrations track the engine version. The
 `scripts/bump-plugin-versions.mjs` `release-it` hook updates every plugin
-manifest, `gemini-extension.json`, `extension/package.json`, and both version
-fields in `extension/package-lock.json`. An engine release `vX.Y.Z` therefore
-publishes matching integration metadata.
+manifest, `gemini-extension.json`, `extension/package.json`, both version fields
+in `extension/package-lock.json`, and both the server and npm-package versions
+in `server.json`. An engine release `vX.Y.Z` therefore publishes matching
+integration and MCP Registry metadata.
 
 ### What the extension does NOT do
 

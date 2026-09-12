@@ -4,6 +4,53 @@ All notable changes to SocratiCode are documented here.
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and [Semantic Versioning](https://semver.org/).
 
 
+## [1.13.3](https://github.com/giancarloerra/socraticode/compare/v1.13.2...v1.13.3) (2026-09-10)
+
+### Bug Fixes
+
+* **config:** do not treat an external git directory as the main worktree ([c68c5d0](https://github.com/giancarloerra/socraticode/commit/c68c5d0082da5f2c735799ad3b0fbea1413a90cf))
+* **graph:** a project-root self match must end resolution, not fall through ([5504a5c](https://github.com/giancarloerra/socraticode/commit/5504a5cb24716ad758436dc6de9ea82321e242de))
+* **graph:** drop the __init__.py gate, keep only the unambiguous self guards ([a07196d](https://github.com/giancarloerra/socraticode/commit/a07196db7ea4190b5832f9ab5a1784c335fc0e76)), closes [#46](https://github.com/giancarloerra/socraticode/issues/46) [#107](https://github.com/giancarloerra/socraticode/issues/107) [#46](https://github.com/giancarloerra/socraticode/issues/46) [#112](https://github.com/giancarloerra/socraticode/issues/112)
+* **graph:** end resolution on a self match at every real path entry, not just the root ([b40b5e8](https://github.com/giancarloerra/socraticode/commit/b40b5e860fe6c25654f7e84b167a2f87fd8a126c))
+* **graph:** extend the [#157](https://github.com/giancarloerra/socraticode/issues/157) self-edge guard to relative imports ([fcac832](https://github.com/giancarloerra/socraticode/commit/fcac832a4ca73be4dfb5d439737e602570376c48))
+* **graph:** gate on any package ancestor, not just the importing directory ([d650753](https://github.com/giancarloerra/socraticode/commit/d650753384b2cbdbe1dffdd3ff242a350f4b36e6)), closes [#46](https://github.com/giancarloerra/socraticode/issues/46)
+* **graph:** stop the Python sibling fallback fabricating edges inside packages ([740fe6f](https://github.com/giancarloerra/socraticode/commit/740fe6f0cac8cf1be673cefdccc6faa3f7fc24d3)), closes [#46](https://github.com/giancarloerra/socraticode/issues/46) [#46](https://github.com/giancarloerra/socraticode/issues/46) [#157](https://github.com/giancarloerra/socraticode/issues/157)
+* **indexer:** gate after the artifact config read, and announce after checking ([fd6c9cc](https://github.com/giancarloerra/socraticode/commit/fd6c9cc96645e35a0787c67cc1f597a0d2b0b744))
+* **indexer:** gate the terminal status write, and the graph rebuild ([b0905c1](https://github.com/giancarloerra/socraticode/commit/b0905c1c916e589bd675370b37f76ef7187d8328))
+* **indexer:** read indexing status strictly, and pin recovery in CI ([c559db7](https://github.com/giancarloerra/socraticode/commit/c559db7872d7b418a15e53ff084d16d40479f1be))
+* **indexer:** reconcile stale hashes against the points actually stored ([28db487](https://github.com/giancarloerra/socraticode/commit/28db48716d59f06f102aea309b33372e481a6d65))
+* **indexer:** repair a completed status written as the lock was lost ([e8a4009](https://github.com/giancarloerra/socraticode/commit/e8a40097164f25fa3983485a570d7a1884bd6582))
+* **indexer:** stop writing once ownership is lost, and never past a phase ([e5f1246](https://github.com/giancarloerra/socraticode/commit/e5f1246732d09a8e8d94a04d11c45db04979e5ff))
+* **lock:** handle a rejecting compromise handler, and restore a displaced doc ([5ed44eb](https://github.com/giancarloerra/socraticode/commit/5ed44ebc6baa1cdc7391c737ba0eb42f5f87b591))
+* **lock:** stand down when the index lock is lost mid-run ([f742845](https://github.com/giancarloerra/socraticode/commit/f742845b8c83d07c14d501abcf8842fb928cd0af))
+* **qdrant:** retry, bound and share the paged payload scroll ([f46f85d](https://github.com/giancarloerra/socraticode/commit/f46f85dd2be8d23d59b741bc0b1a8a5277a9c9e3))
+* **qdrant:** scroll project metadata by page, and read only the field used ([79b4604](https://github.com/giancarloerra/socraticode/commit/79b4604418895fca9deab66f119a48bce77ab450))
+* **startup:** resolve a linked worktree to its main checkout before resuming ([915b20b](https://github.com/giancarloerra/socraticode/commit/915b20bbe4cc631e755e010ee46f00f7439f1fd2))
+
+### Documentation
+
+* **graph:** name a reachable example in the sibling fall-through comment ([19b94ac](https://github.com/giancarloerra/socraticode/commit/19b94ac718737d347836d8f01fc963ef3cfe8378))
+
+### Tests
+
+* make the linked checkout participate in the worktree regression ([fe9e4c4](https://github.com/giancarloerra/socraticode/commit/fe9e4c4d30e907d5bcb377e92e1337c636e69c19))
+* make the status-read regression exercise the indexing entry point ([f197357](https://github.com/giancarloerra/socraticode/commit/f197357bc934e7b2d22a8cb8cf5bc3183a32edab))
+
+## [1.13.2](https://github.com/giancarloerra/socraticode/compare/v1.13.1...v1.13.2) (2026-09-09)
+
+### Bug Fixes
+
+* **indexer:** do not mark a file indexed when its upsert was partially skipped ([ff3c06b](https://github.com/giancarloerra/socraticode/commit/ff3c06bbf09784a9bb1bcfdfafd650f9cc2904f7))
+* **indexer:** exclude stranded files with stale hashes from filesIndexed ([388773b](https://github.com/giancarloerra/socraticode/commit/388773b0368bc97815bcd8621a947eab6c61d85a))
+* **indexer:** report files actually indexed, not files walked ([07dd187](https://github.com/giancarloerra/socraticode/commit/07dd18781999d022d5a7293914c02e1e727447bd))
+* **indexer:** report files the index represents, not files walked ([a511f27](https://github.com/giancarloerra/socraticode/commit/a511f27437a45911a984d407f2db4bfd821cc006))
+* **qdrant:** fail the operation when any point is skipped after fallback ([c47a843](https://github.com/giancarloerra/socraticode/commit/c47a843d2065defcb78371cac642c06ab50f8db5))
+
+### Tests
+
+* **helpers:** build the Qdrant test client from the service's getClient() ([27eed85](https://github.com/giancarloerra/socraticode/commit/27eed85aca674e220cd12ae40902c6b184a8db71))
+* reach Qdrant through the service client, not the raw test helper ([a46bc11](https://github.com/giancarloerra/socraticode/commit/a46bc11c903a5d99d1e09ae88bcb0dd5fbbe6fe8))
+
 ## [1.13.1](https://github.com/giancarloerra/socraticode/compare/v1.13.0...v1.13.1) (2026-09-07)
 
 ### Bug Fixes

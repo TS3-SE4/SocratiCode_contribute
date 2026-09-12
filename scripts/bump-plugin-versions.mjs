@@ -3,24 +3,16 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 //
 // release-it `after:bump` hook. Synchronises the version field across
-// every plugin / extension manifest in the repo so a single engine
-// release also bumps the Claude / Cursor / Codex plugins, the Gemini
-// extension, and the VS Code / Open VSX extension. Skips manifests that
-// don't exist.
+// every release manifest in the repo so a single engine release also bumps
+// the Claude / Cursor / Codex plugins, the Gemini extension, the VS Code /
+// Open VSX extension, and the official MCP Registry entry. Skips manifests
+// that don't exist.
 //
 // Usage: node scripts/bump-plugin-versions.mjs <version>
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-
-const MANIFESTS = [
-  ".claude-plugin/plugin.json",
-  ".cursor-plugin/plugin.json",
-  ".codex-plugin/plugin.json",
-  "gemini-extension.json",
-  "extension/package.json",
-  "extension/package-lock.json",
-];
+import { setManifestVersion, VERSIONED_MANIFESTS } from "./release-manifests.mjs";
 
 const version = process.argv[2];
 if (!version) {
@@ -29,24 +21,12 @@ if (!version) {
 }
 
 let touched = 0;
-for (const rel of MANIFESTS) {
+for (const rel of VERSIONED_MANIFESTS) {
   const path = resolve(process.cwd(), rel);
   if (!existsSync(path)) continue;
   try {
     const json = JSON.parse(readFileSync(path, "utf8"));
-    let changed = false;
-    if (json.version !== version) {
-      json.version = version;
-      changed = true;
-    }
-    if (
-      rel.endsWith("package-lock.json") &&
-      json.packages?.[""] &&
-      json.packages[""].version !== version
-    ) {
-      json.packages[""].version = version;
-      changed = true;
-    }
+    const changed = setManifestVersion(rel, json, version);
     if (!changed) continue;
     writeFileSync(path, `${JSON.stringify(json, null, 2)}\n`);
     console.log(`bumped ${rel} -> ${version}`);

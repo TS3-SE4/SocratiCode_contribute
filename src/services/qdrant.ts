@@ -256,6 +256,51 @@ export async function deleteCollection(name: string): Promise<void> {
   }
 }
 
+/**
+ * Scroll one payload field across an entire collection.
+ *
+ * Enumeration has to be complete, because callers use it to decide what exists.
+ * So this follows the cursor rather than taking the first page, retries a
+ * transient failure instead of returning a short answer, and stops if the
+ * cursor ever fails to advance — an unbounded cursor loop cannot be caught,
+ * since an infinite loop never throws.
+ *
+ * Only `field` is fetched. A point can carry a large payload — a project's
+ * entire path-to-hash map, in the metadata collection — so an unprojected read
+ * scales with the stored data rather than with the number of points.
+ */
+async function scrollPayloadField(
+  collName: string,
+  field: string,
+  label: string,
+  pageSize: number,
+  visit: (value: unknown) => void,
+): Promise<void> {
+  const qdrant = getClient();
+  let offset: string | number | Record<string, unknown> | undefined | null;
+
+  do {
+    const page = await withRetry(
+      () =>
+        qdrant.scroll(collName, {
+          limit: pageSize,
+          with_payload: { include: [field] },
+          with_vector: false,
+          ...(offset === undefined || offset === null ? {} : { offset }),
+        }),
+      label,
+    );
+    for (const point of page.points) visit(point.payload?.[field]);
+
+    const next = page.next_page_offset;
+    if (next !== undefined && next !== null && JSON.stringify(next) === JSON.stringify(offset)) {
+      logger.warn(`${label}: cursor did not advance, stopping`, { collName });
+      break;
+    }
+    offset = next;
+  } while (offset !== undefined && offset !== null);
+}
+
 /** List all codebase, codegraph, and context artifact entries.
  * Codebase and context entries are actual collections; codegraph entries come from metadata.
  *
@@ -279,21 +324,37 @@ export async function listCodebaseCollections(): Promise<string[]> {
   // Listing is read-only: an absent metadata collection means there are no metadata-only entries yet.
   if (collections.collections.some((collection) => collection.name === METADATA_COLLECTION)) {
     try {
-      const metaPoints = await qdrant.scroll(METADATA_COLLECTION, {
-        limit: 100,
-        with_payload: true,
-      });
-      for (const point of metaPoints.points) {
-        const collName = point.payload?.collectionName as string | undefined;
-        if (
-          (collName?.startsWith(`${p}codegraph_`) || collName?.startsWith(`${p}context_`)) &&
-          !result.includes(collName)
-        ) {
-          result.push(collName);
-        }
-      }
+      // This list must be complete: the manage tools present it as the set of
+      // indexed projects, and startup reads it to decide what to resume. The
+      // previous single unpaginated request silently dropped everything past
+      // the hundredth point, and fetched every project's whole hash map to
+      // read one string per point.
+      const seen = new Set(result);
+      await scrollPayloadField(
+        METADATA_COLLECTION,
+        "collectionName",
+        "listCodebaseCollections(metadata)",
+        1000,
+        (value) => {
+          // Narrow rather than cast: optional chaining guards null and
+          // undefined, so a non-string here would have reached `.startsWith`
+          // and thrown, taking out a read-only listing over one bad point.
+          if (typeof value !== "string") return;
+          if (
+            (value.startsWith(`${p}codegraph_`) || value.startsWith(`${p}context_`)) &&
+            !seen.has(value)
+          ) {
+            seen.add(value);
+            result.push(value);
+          }
+        },
+      );
     } catch (err) {
-      logger.info("listCodebaseCollections: metadata scroll failed", {
+      // Non-fatal: this is a read-only listing and the collections found above
+      // stand. Warned rather than logged at info because paging made a partial
+      // result more reachable, not less — a failure can now land on page three
+      // of five and return a list that looks complete.
+      logger.warn("listCodebaseCollections: metadata scroll failed, list may be incomplete", {
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -355,7 +416,16 @@ const MAX_BM25_TEXT_CHARS = 32_000; // ~32KB
 
 /** Upsert pre-embedded points into a collection (no embedding generation).
  * bm25Text is forwarded to Qdrant's server-side BM25 inference (truncated if too long).
- * Returns the number of points that were skipped due to upsert errors. */
+ *
+ * A failing batch is retried point by point to isolate the bad point(s). If any
+ * point still fails, this throws: a partial write must fail the whole indexing
+ * operation.
+ *
+ * Callers must not treat a partial write as success. A re-indexed file has its
+ * previous chunks deleted before this call, so recording it as indexed after a
+ * partial failure strands it at zero chunks with a content hash that suppresses
+ * every future re-index. Throwing leaves stored hashes and earlier checkpoints
+ * untouched, so the next index or update retries the file naturally. */
 export async function upsertPreEmbeddedChunks(
   collectionName: string,
   points: Array<{
@@ -364,8 +434,8 @@ export async function upsertPreEmbeddedChunks(
     bm25Text: string;
     payload: Record<string, unknown>;
   }>,
-): Promise<{ pointsSkipped: number }> {
-  if (points.length === 0) return { pointsSkipped: 0 };
+): Promise<void> {
+  if (points.length === 0) return;
 
   const qdrant = getClient();
   const namedPoints = points.map((p) => ({
@@ -383,6 +453,7 @@ export async function upsertPreEmbeddedChunks(
   }));
 
   let totalSkipped = 0;
+  const skippedPaths = new Set<string>();
 
   // Upsert in batches of 100, with per-point fallback on failure
   for (let i = 0; i < namedPoints.length; i += 100) {
@@ -406,6 +477,11 @@ export async function upsertPreEmbeddedChunks(
         } catch (pointErr) {
           skipped++;
           const filePath = point.payload?.relativePath ?? point.payload?.filePath ?? point.id;
+          // Record the owning file so the caller can leave its hash untouched
+          // and re-index it on the next pass.
+          if (typeof point.payload?.relativePath === "string") {
+            skippedPaths.add(point.payload.relativePath);
+          }
           logger.warn(`Skipping point that failed upsert`, {
             pointId: point.id,
             filePath: String(filePath),
@@ -420,7 +496,17 @@ export async function upsertPreEmbeddedChunks(
     }
   }
 
-  return { pointsSkipped: totalSkipped };
+  if (totalSkipped > 0) {
+    const affected = [...skippedPaths].sort();
+    const shown = affected.slice(0, 10).join(", ");
+    const more = affected.length > 10 ? `, and ${affected.length - 10} more` : "";
+    throw new Error(
+      `Qdrant upsert incomplete for collection=${collectionName}: ` +
+      `${totalSkipped}/${points.length} point(s) failed after per-point retry. ` +
+      `Affected files: ${shown}${more}. ` +
+      `Nothing has been recorded as indexed; re-run the index once Qdrant is healthy.`,
+    );
+  }
 }
 
 /** Delete all chunks for a specific file (matched by relativePath) */
@@ -798,6 +884,35 @@ export async function searchChunksWithFilter(
   }));
 }
 
+/**
+ * Every `relativePath` that currently has at least one point in the collection.
+ *
+ * Exists so a caller can tell "this file is unchanged, skip it" apart from "this
+ * file's chunks are gone". The stored hash map cannot make that distinction on
+ * its own: it records what was hashed, not what survived.
+ *
+ * Pages through with `scroll` rather than `facet` deliberately — facet takes a
+ * limit and offers no cursor, so it cannot enumerate a repository's worth of
+ * paths reliably. Payload is narrowed to the one field and vectors are excluded,
+ * so the cost is one small round trip per `pageSize` points.
+ */
+export async function listIndexedFilePaths(
+  collName: string,
+  pageSize = 1000,
+): Promise<Set<string>> {
+  const paths = new Set<string>();
+  await scrollPayloadField(
+    collName,
+    "relativePath",
+    `listIndexedFilePaths(${collName})`,
+    pageSize,
+    (value) => {
+      if (typeof value === "string") paths.add(value);
+    },
+  );
+  return paths;
+}
+
 /** Get collection info.
  * Returns the collection info if it exists, null if the collection does not exist,
  * or throws an error if the request fails for any other reason (network, timeout, etc.).
@@ -1091,6 +1206,35 @@ export async function getProjectMetadata(collName: string): Promise<ProjectMetad
     });
     return null;
   }
+}
+
+/**
+ * Persisted indexing status, without the best-effort swallowing.
+ *
+ * `getProjectMetadata()` is display-oriented: it catches every read error and
+ * answers `null`, which is right for showing a status line and wrong for
+ * deciding one. A caller that asks "was the last run interrupted?" and takes
+ * `null` for "no" will, on a transient metadata read failure, skip the recovery
+ * that failure should have triggered — and then persist the still-damaged index
+ * as `completed`, which is worse than not having run at all.
+ *
+ * Returns `null` only when there is genuinely no metadata for the collection.
+ * Transport, parsing and validation failures propagate, so the caller aborts
+ * rather than guessing.
+ */
+export async function loadIndexingStatus(collName: string): Promise<IndexingStatus | null> {
+  const payload = await loadMetadataPayloadReadOnly(collName);
+  if (payload === null) return null;
+
+  const status = payload.indexingStatus;
+  // Absent on records written before the field existed; those were complete.
+  if (status === undefined || status === null) return "completed";
+  if (status === "in-progress" || status === "completed") return status;
+
+  throw new Error(
+    `Unrecognised indexingStatus ${JSON.stringify(status)} in metadata for ${collName}. ` +
+      "Refusing to guess whether the last run completed.",
+  );
 }
 
 /** Delete project metadata.

@@ -1,7 +1,7 @@
 {
   "name": "socraticode",
   "mcpName": "io.github.giancarloerra/socraticode",
-  "version": "1.13.1",
+  "version": "1.13.3",
   "description": "SocratiCode — MCP server for local codebase indexing, semantic search, and code dependency graphs. All private, all local via Docker.",
   "type": "module",
   "main": "dist/index.js",
@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "tsc && node scripts/copy-assets.mjs",
+    "check:release-versions": "node scripts/check-release-versions.mjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "lint": "biome check src/ tests/",

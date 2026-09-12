@@ -6,19 +6,19 @@
     "url": "https://github.com/giancarloerra/socraticode",
     "source": "github"
   },
-  "version": "1.0.1",
+  "version": "1.13.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "socraticode",
-      "version": "1.0.1",
+      "version": "1.13.3",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "EMBEDDING_PROVIDER",
-          "description": "Embedding provider to use: ollama (default), openai, or google",
+          "description": "Embedding provider to use: ollama (default), openai, google, lmstudio, or litellm",
           "isRequired": false,
           "format": "string",
           "isSecret": false
@@ -46,7 +46,70 @@
         },
         {
           "name": "EMBEDDING_MODEL",
-          "description": "Embedding model name (defaults per provider: nomic-embed-text for ollama, text-embedding-3-small for openai, gemini-embedding-001 for google)",
+          "description": "Embedding model name (defaults per provider; required for lmstudio and litellm)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "EMBEDDING_DIMENSIONS",
+          "description": "Embedding vector dimensions (defaults per provider; required for lmstudio and litellm)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "OLLAMA_MODE",
+          "description": "Ollama mode: auto (default), docker, or external",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "OLLAMA_API_KEY",
+          "description": "Optional API key for authenticated Ollama proxies",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "LMSTUDIO_URL",
+          "description": "LM Studio OpenAI-compatible base URL (default: http://localhost:1234/v1)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "LMSTUDIO_API_KEY",
+          "description": "Optional API key when LM Studio authentication is enabled",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "LMSTUDIO_ALLOW_MISSING_MODEL_LISTING",
+          "description": "Allow compatible embedding servers without a models endpoint to be probed directly",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "LITELLM_URL",
+          "description": "LiteLLM OpenAI-compatible base URL (default: http://localhost:4000/v1)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "LITELLM_API_KEY",
+          "description": "LiteLLM master or virtual API key (required when EMBEDDING_PROVIDER=litellm)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "LITELLM_SEND_DIMENSIONS",
+          "description": "Forward the dimensions parameter through LiteLLM when explicitly enabled",
           "isRequired": false,
           "format": "string",
           "isSecret": false
