@@ -403,27 +403,37 @@ export function chunkArtifactContent(
     const chunkContent = lines.slice(start, end).join("\n");
     const id = generateChunkId(artifactPath, artifactName, start);
 
-    // A collection keeps the representation it was created with. Splitting is
-    // the format-2 representation; an artifact collection stored as format 0 or
-    // 1 keeps truncating, so what is written never drifts from what its
-    // persisted effective profile says.
-    //
-    // Text at or below the cap comes back as a single piece either way, so the
-    // common case is unchanged: one chunk, the parent's own id and line range.
-    const pieces =
-      indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION
-        ? [{
-            text: chunkContent.slice(0, maxChunkChars),
-            startLine: 1,
-            endLine: Math.min(CHUNK_SIZE, end - start),
-          }]
-        : splitTextToCharCap(chunkContent, maxChunkChars);
+    // A collection keeps the representation it was created with. Format 0 and
+    // 1 run the released path exactly: truncate and store, with no filtering.
+    // The released chunker stored every window, including one holding nothing
+    // but whitespace, so dropping such a window here would delete a point from
+    // a collection that still declares the legacy format.
+    if (indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION) {
+      chunks.push({
+        id,
+        content:
+          chunkContent.length > maxChunkChars
+            ? chunkContent.substring(0, maxChunkChars)
+            : chunkContent,
+        startLine: start + 1, // 1-based
+        endLine: end,
+        artifactName,
+      });
+
+      if (end >= lines.length) break;
+      continue;
+    }
+
+    // Text at or below the cap comes back as a single piece, so the common case
+    // is unchanged: one chunk, the parent's own id and line range.
+    const pieces = splitTextToCharCap(chunkContent, maxChunkChars);
     for (const [index, piece] of pieces.entries()) {
-      // A window that is mostly padding splits into pieces that hold nothing but
-      // whitespace. Each would otherwise cost an embedding call, occupy a point
-      // in Qdrant and compete in search results, so drop them — the same
+      // A window that is mostly padding splits into pieces that hold nothing
+      // but whitespace. Each would otherwise cost an embedding call, occupy a
+      // point in Qdrant and compete in search results, so drop them — the same
       // invariant chunkFileContent holds for code chunks. Dropping is safe: ids
-      // are derived per piece, so removing one never renumbers another.
+      // are derived per piece, so removing one never renumbers another. This
+      // applies to format 2 only; see the legacy branch above.
       if (piece.text.trim().length === 0) continue;
       chunks.push({
         id: index === 0 ? id : continuationId(id, index),
@@ -432,7 +442,14 @@ export function chunkArtifactContent(
         // 0-based index of the window's first line, so adding it maps them onto
         // the artifact's own 1-based numbering.
         startLine: start + piece.startLine,
-        endLine: Math.min(start + piece.endLine, end),
+        // The window's last piece ends where the window ends. Deriving it from
+        // the piece instead would come up a line short whenever the window's
+        // final line is blank: the text then ends on a newline, and a trailing
+        // newline closes the last line rather than opening another. The window
+        // covers that blank line, so a chunk holding the same bytes as the
+        // released one must claim the same range.
+        endLine:
+          index === pieces.length - 1 ? end : Math.min(start + piece.endLine, end),
         artifactName,
       });
     }
@@ -986,13 +1003,16 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
     lines.push(
       `Context index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} pending until a fresh index: ${profileDifferences.join(", ")}`,
     );
-    // Say what "a fresh index" takes. Re-running the index applies none of
-    // these: an artifact whose content hash and configuration signature are
-    // unchanged is not re-chunked, so one indexed before the character cap
-    // started splitting keeps whatever was truncated out of it. Artifacts are
-    // the content most likely to have overflowed the cap.
+    // Say what "a fresh index" takes, and that the index is fine until then.
+    // Re-indexing applies none of these, but not because it skips work:
+    // codebase_context_index rewrites every artifact whether or not it changed.
+    // It applies nothing because the collection keeps the profile it was
+    // created with, so each rewrite reproduces the stored representation — one
+    // indexed before the character cap started splitting keeps whatever was
+    // truncated out of it. Artifacts are the content most likely to have
+    // overflowed the cap.
     lines.push(
-      "Context index profile: re-indexing does not apply these — unchanged artifacts are not re-chunked. Run codebase_context_remove, then codebase_context_index.",
+      "Context index profile: this index remains fully usable as it is. The collection keeps the profile it was created with, so re-indexing reproduces the stored representation and applies none of these. To apply them, run codebase_context_remove, then codebase_context_index; that is optional.",
     );
   }
   if (effectiveProfile.legacyUnverifiedFields.length > 0) {

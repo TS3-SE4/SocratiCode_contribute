@@ -584,18 +584,22 @@ function splitToCharCap(
 /**
  * Split one over-long chunk into cap-sized pieces.
  *
- * The split itself is `chunkByCharacters`, which already owns the safe-boundary
- * scan, the newline-counted line tracking and a discriminator unique within one
- * call. Only the ids and the line numbers are rebased onto the parent, so the
- * pieces stay addressable and keep pointing at the lines they came from.
+ * The split itself is `chunkByCharacters` at format 2, which already owns the
+ * boundary rule, the newline-counted line tracking and a discriminator unique
+ * within one call. Only the ids and the line numbers are rebased onto the
+ * parent, so the pieces stay addressable and keep pointing at the lines they
+ * came from.
  */
 function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk[] {
+  // Only reachable for format 2: splitToCharCap returns before this for a
+  // collection stored below it.
   const pieces = chunkByCharacters(
     chunk.filePath,
     chunk.relativePath,
     chunk.content,
     chunk.language,
     maxChunkChars,
+    SPLITTING_INDEX_FORMAT_VERSION,
   );
   return pieces.map((piece, index) => ({
     ...piece,
@@ -608,18 +612,29 @@ function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk
     // also re-derives the parent's endLine, which truncation used to leave
     // claiming lines the chunk no longer held.
     startLine: chunk.startLine + piece.startLine - 1,
-    endLine: chunk.startLine + piece.endLine - 1,
+    // The parent's last piece ends where the parent ended. Deriving it from the
+    // piece instead would come up a line short whenever the parent's final line
+    // is blank: the text then ends on a newline, and a trailing newline closes
+    // the last line rather than opening another. Together the pieces cover the
+    // parent exactly, so the last one has to reach its end.
+    endLine:
+      index === pieces.length - 1 ? chunk.endLine : chunk.startLine + piece.endLine - 1,
     type: chunk.type,
   }));
 }
 
 /**
  * Character-based chunking for minified/bundled content whose average line
- * length exceeds MAX_AVG_LINE_LENGTH. Splits at safe token boundaries
- * (newline, space, tab, semicolon, comma) where one is available near the end
- * of the window, so chunks stay within MAX_CHUNK_CHARS and usually avoid
- * splitting mid-identifier. See splitTextToCharCap for how far back the scan
- * looks and what it does when it finds nothing.
+ * length exceeds MAX_AVG_LINE_LENGTH, so that chunks stay within
+ * MAX_CHUNK_CHARS.
+ *
+ * Where the boundary falls depends on the collection's stored format, because
+ * a collection keeps the representation it was created with. Format 0 and 1
+ * run the released scan, which accepts a newline, space, tab, semicolon or
+ * comma near the end of the window and so usually avoids splitting
+ * mid-identifier. Format 2 ends a piece at the last newline at or before the
+ * cap, and at the cap itself where the span holds no newline — see
+ * splitTextToCharCap.
  *
  * NOTE: The chunk `id` uses the byte offset as its discriminator (not the
  * line number) because minified files may consist of a single very long
@@ -631,7 +646,16 @@ function chunkByCharacters(
   content: string,
   language: string,
   maxChunkChars: number,
+  indexFormatVersion: number,
 ): FileChunk[] {
+  // Format 0 and 1 keep the released algorithm exactly — boundaries, offsets
+  // and ids alike. This path already produces chunks within the cap, so the
+  // gate in splitToCharCap runs too late to restore them; the choice has to be
+  // made here.
+  if (indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION) {
+    return chunkByCharactersLegacy(filePath, relativePath, content, language, maxChunkChars);
+  }
+
   let offset = 0;
   return splitTextToCharCap(content, maxChunkChars).map((piece) => {
     const chunk: FileChunk = {
@@ -647,6 +671,67 @@ function chunkByCharacters(
     offset += piece.text.length;
     return chunk;
   });
+}
+
+/**
+ * The released character-based chunker, kept verbatim for collections stored as
+ * format 0 or 1.
+ *
+ * Its boundary set (newline, space, tab, semicolon, comma) and its scan that
+ * starts at the limit itself decide where every chunk begins, and the chunk id
+ * is seeded from that byte offset. Reproducing the bytes is therefore not
+ * enough: anything but this exact loop gives such a collection different ids
+ * and different line ranges on the next incremental update.
+ */
+function chunkByCharactersLegacy(
+  filePath: string,
+  relativePath: string,
+  content: string,
+  language: string,
+  maxChunkChars: number,
+): FileChunk[] {
+  const chunks: FileChunk[] = [];
+  let offset = 0;
+  let currentLine = 1;
+
+  while (offset < content.length) {
+    let end = Math.min(offset + maxChunkChars, content.length);
+
+    // Scan backwards from the hard limit to find a safe split boundary.
+    // If none is found within the window, fall through and split at the limit.
+    if (end < content.length) {
+      for (let i = end; i > offset; i--) {
+        const ch = content[i];
+        if (ch === "\n" || ch === " " || ch === "\t" || ch === ";" || ch === ",") {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+
+    const chunkContent = content.slice(offset, end);
+    const startLine = currentLine;
+    const newlineCount = (chunkContent.match(/\n/g) ?? []).length;
+    const endLine = startLine + newlineCount;
+
+    chunks.push({
+      id: chunkId(relativePath, offset), // byte offset → unique ID even for 1-line files
+      filePath,
+      relativePath,
+      content: chunkContent,
+      startLine,
+      endLine,
+      language,
+      type: "code",
+    });
+
+    // Advance line counter: if the chunk ended with a newline the next
+    // chunk starts on a new line; otherwise we're still on the same line.
+    currentLine = chunkContent.endsWith("\n") ? endLine + 1 : endLine;
+    offset = end;
+  }
+
+  return chunks;
 }
 
 /**
@@ -698,7 +783,7 @@ export function chunkFileContent(
       avgLineLength: Math.round(avgLineLength),
     });
     return splitToCharCap(
-      chunkByCharacters(filePath, relativePath, content, language, maxChunkChars),
+      chunkByCharacters(filePath, relativePath, content, language, maxChunkChars, indexFormatVersion),
       maxChunkChars,
       indexFormatVersion,
     );

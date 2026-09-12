@@ -387,6 +387,7 @@ When `codebase_index` is called:
    │   └── Line-based fallback: 100-line segments with 10-line overlap
    ├── Character cap (`MAX_CHUNK_CHARS`, default 2000 chars): on a format-2 collection a chunk over the cap is split, not truncated
    ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
+   │   └── A piece split off by the cap is seeded from its parent's ID instead
    └── Detect language from file extension
 
 6. BATCHED EMBEDDING + UPSERT (50 files per batch)
@@ -1362,7 +1363,7 @@ Behaviour:
 
 ```typescript
 interface FileChunk {
-  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12)
+  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12); a piece split off by the cap is seeded from its parent's ID
   filePath: string;      // Absolute path
   relativePath: string;  // Relative to project root
   content: string;       // Chunk text content

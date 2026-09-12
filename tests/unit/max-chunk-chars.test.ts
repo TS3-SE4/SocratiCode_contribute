@@ -185,16 +185,60 @@ describe("MAX_CHUNK_CHARS", () => {
       const body = Array(99).fill("x".repeat(39)).join("\n");
       const content = `${body}\nzarquonTailMarker`;
 
+      const { chunkId } = await import("../../src/services/indexer.js");
+
       for (const indexFormatVersion of [0, 1]) {
         const chunks = chunkFileContent("/test/big.ts", "big.ts", content, {
           maxChunkChars: 2000,
           indexFormatVersion,
         });
 
-        for (const chunk of chunks) {
-          expect(chunk.content.length).toBeLessThanOrEqual(2000);
-        }
-        expect(chunks.some((c) => c.content.includes("zarquonTailMarker"))).toBe(false);
+        // The released output, byte for byte: one chunk holding the first 2000
+        // characters, claiming the lines it was cut from, with the id seeded
+        // from the line it starts at. Checking only the length and the absent
+        // marker would pass on an id or a line range that had quietly moved,
+        // which is the drift an existing collection cannot survive.
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0].content).toBe(content.slice(0, 2000));
+        expect([chunks[0].startLine, chunks[0].endLine]).toEqual([1, 100]);
+        expect(chunks[0].id).toBe(chunkId("big.ts", 1));
+        expect(chunks[0].content).not.toContain("zarquonTailMarker");
+      }
+    });
+
+    it("reproduces the released line-based output for format 0 and 1", async () => {
+      // Past CHUNK_SIZE lines the line-based path opens further windows, each
+      // truncated on its own. Their ids and line ranges are what an existing
+      // collection addresses its points by, so they have to come out as
+      // released — not merely within the cap.
+      const { chunkFileContent, chunkId } = await import("../../src/services/indexer.js");
+
+      // 250 lines of 39 characters: three overlapping windows, each far past a
+      // 2000 cap, with an average line length well below MAX_AVG_LINE_LENGTH.
+      const lines = Array.from(
+        { length: 250 },
+        (_, i) => `${String(i + 1).padStart(4, "0")}${"z".repeat(35)}`,
+      );
+      const content = lines.join("\n");
+
+      for (const indexFormatVersion of [0, 1]) {
+        const chunks = chunkFileContent("/test/long.txt", "long.txt", content, {
+          maxChunkChars: 2000,
+          indexFormatVersion,
+        });
+
+        expect(chunks.map((c) => [c.startLine, c.endLine])).toEqual([
+          [1, 100], [91, 190], [181, 250],
+        ]);
+        expect(chunks.map((c) => c.id)).toEqual(
+          [1, 91, 181].map((startLine) => chunkId("long.txt", startLine)),
+        );
+        // Each chunk is its own window truncated at the cap, exactly as released.
+        expect(chunks.map((c) => c.content)).toEqual(
+          [0, 90, 180].map((start) =>
+            lines.slice(start, Math.min(start + 100, lines.length)).join("\n").slice(0, 2000),
+          ),
+        );
       }
     });
 
@@ -225,10 +269,15 @@ describe("MAX_CHUNK_CHARS", () => {
 
       for (const indexFormatVersion of [0, 1]) {
         const chunks = chunkArtifactContent(content, "notes", "notes.md", 2000, indexFormatVersion);
-        for (const chunk of chunks) {
-          expect(chunk.content.length).toBeLessThanOrEqual(2000);
-        }
-        expect(chunks.some((c) => c.content.includes("zarquonTailMarker"))).toBe(false);
+
+        // The released output, byte for byte. The id is the released value for
+        // this artifact name, path and window start: an artifact point is
+        // addressed by it, so it must not move for an existing collection.
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0].content).toBe(content.slice(0, 2000));
+        expect([chunks[0].startLine, chunks[0].endLine]).toEqual([1, 100]);
+        expect(chunks[0].id).toBe("dec719d1-7e32-3a25-4612-2c18ccd5d47a");
+        expect(chunks[0].content).not.toContain("zarquonTailMarker");
       }
 
       const fresh = chunkArtifactContent(content, "notes", "notes.md", 2000, 2);
@@ -236,6 +285,170 @@ describe("MAX_CHUNK_CHARS", () => {
         expect(chunk.content.length).toBeLessThanOrEqual(2000);
       }
       expect(fresh.some((c) => c.content.includes("zarquonTailMarker"))).toBe(true);
+    });
+
+    it("reproduces the released boundaries, ids and line ranges for format 0 and 1", async () => {
+      // The minified path decides where every chunk begins, and the chunk id is
+      // seeded from that byte offset. Reproducing the bytes is not enough: a
+      // different boundary set, or a different line counter, gives an existing
+      // collection different ids and line ranges on its next incremental update
+      // — the drift the version gate exists to prevent.
+      //
+      // The expected values below are the released v1.13.x output: the scan
+      // looks for a newline, space, tab, semicolon or comma starting at the
+      // limit itself, and the line counter only advances past a chunk that ends
+      // on a newline.
+      const { chunkFileContent } = await import("../../src/services/indexer.js");
+
+      // Six 600-character lines. Every line is far longer than
+      // MAX_AVG_LINE_LENGTH, so this takes the minified path.
+      const line = "x".repeat(599);
+      const content = `${Array(6).fill(line).join("\n")}\n`;
+
+      for (const indexFormatVersion of [0, 1]) {
+        const chunks = chunkFileContent("/test/min.js", "min.js", content, {
+          maxChunkChars: 700,
+          indexFormatVersion,
+        });
+
+        // Boundaries: each chunk ends just past a newline, because the scan
+        // finds one within the window.
+        expect(chunks.map((c) => c.content.length)).toEqual([600, 600, 600, 600, 600, 600]);
+
+        // Line ranges: the released counter advances only past a newline, so a
+        // chunk that ends on one starts the next chunk two lines on.
+        expect(chunks.map((c) => [c.startLine, c.endLine])).toEqual([
+          [1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12],
+        ]);
+
+        // Ids: seeded from the byte offset each chunk starts at.
+        const { chunkId } = await import("../../src/services/indexer.js");
+        expect(chunks.map((c) => c.id)).toEqual(
+          [0, 600, 1200, 1800, 2400, 3000].map((offset) => chunkId("min.js", offset)),
+        );
+
+        expect(chunks.map((c) => c.content).join("")).toBe(content);
+      }
+    });
+
+    it("keeps the released delimiters for format 0 and 1, not only newlines", async () => {
+      // The released scan also accepts a space, tab, semicolon or comma. The
+      // format-2 splitter accepts a newline only, so a window whose only
+      // delimiter is a semicolon proves the two paths are actually different.
+      const { chunkFileContent } = await import("../../src/services/indexer.js");
+
+      const content = `${"a".repeat(300)} ${"b".repeat(300)};${"c".repeat(900)}`;
+
+      const legacy = chunkFileContent("/test/min.js", "min.js", content, {
+        maxChunkChars: 600,
+        indexFormatVersion: 0,
+      });
+      const fresh = chunkFileContent("/test/min.js", "min.js", content, {
+        maxChunkChars: 600,
+        indexFormatVersion: 2,
+      });
+
+      // Legacy ends on the space it found; format 2 has no newline to find and
+      // ends at the cap.
+      expect(legacy[0].content.endsWith(" ")).toBe(true);
+      expect(fresh[0].content.length).toBe(600);
+      expect(legacy[0].content.length).not.toBe(fresh[0].content.length);
+
+      // Neither loses a character.
+      expect(legacy.map((c) => c.content).join("")).toBe(content);
+      expect(fresh.map((c) => c.content).join("")).toBe(content);
+    });
+
+    it("stores a whitespace-only artifact window for format 0 and 1", async () => {
+      // The released artifact chunker pushed every window, including one holding
+      // nothing but whitespace. Dropping it here would delete a point from a
+      // collection that still declares the legacy format.
+      const { chunkArtifactContent } = await import("../../src/services/context-artifacts.js");
+
+      const whitespaceOnly = Array(150).fill("   ").join("\n");
+
+      for (const indexFormatVersion of [0, 1]) {
+        const chunks = chunkArtifactContent(
+          whitespaceOnly, "notes", "notes.md", 2000, indexFormatVersion,
+        );
+        expect(chunks.length).toBeGreaterThan(0);
+        expect(chunks.every((c) => c.content.trim().length === 0)).toBe(true);
+      }
+
+      // Format 2 drops them: each would cost an embedding call and a point.
+      const fresh = chunkArtifactContent(whitespaceOnly, "notes", "notes.md", 2000, 2);
+      expect(fresh).toHaveLength(0);
+    });
+
+    it("keeps the window's line range when its last line is blank", async () => {
+      // A window whose final line is blank ends on a newline, and a trailing
+      // newline closes the last line rather than opening another. Deriving the
+      // last piece's endLine from the piece would therefore come up a line
+      // short — a chunk holding the same bytes as the released one, claiming a
+      // range one line narrower. Markdown and SQL artifacts put blank lines
+      // between paragraphs and statements, so this is the ordinary case.
+      const { chunkArtifactContent } = await import("../../src/services/context-artifacts.js");
+
+      // 250 lines with the 100th and 190th blank: the first two windows both
+      // end on a blank line. Nothing here exceeds a 2000 cap, so no split
+      // happens and the output has to match the released one exactly.
+      const lines = Array.from({ length: 250 }, (_, i) =>
+        i === 99 || i === 189 ? "" : `line ${i + 1}`,
+      );
+      const chunks = chunkArtifactContent(lines.join("\n"), "notes", "notes.md", 2000, 2);
+
+      expect(chunks.map((c) => [c.startLine, c.endLine])).toEqual([
+        [1, 100], [91, 190], [181, 250],
+      ]);
+    });
+
+    it("lets the last piece of a split chunk reach the parent's last line", async () => {
+      // The same rule on the code side: the pieces together cover the parent
+      // exactly, so the final one ends where the parent ended even when the
+      // parent's last line is blank.
+      process.env[ENV_KEY] = "600";
+      const { chunkFileContent } = await import("../../src/services/indexer.js");
+
+      // 250 lines of 40 characters with every 100th blank, so each 100-line
+      // window is past the cap and ends on a blank line.
+      const lines = Array.from({ length: 250 }, (_, i) =>
+        (i + 1) % 100 === 0 ? "" : `${String(i + 1).padStart(4, "0")}${"z".repeat(35)}`,
+      );
+      const chunks = chunkFileContent("/tmp/long.txt", "long.txt", lines.join("\n"));
+
+      // Windows start every CHUNK_SIZE - CHUNK_OVERLAP lines, and each window's
+      // last piece has to end on the window's own last line.
+      expect(chunks.map((c) => c.endLine)).toContain(100);
+      expect(chunks.map((c) => c.endLine)).toContain(190);
+      expect(chunks.map((c) => c.endLine)).toContain(250);
+      for (const c of chunks) {
+        expect(c.endLine).toBeLessThanOrEqual(lines.length);
+        expect(c.endLine).toBeGreaterThanOrEqual(c.startLine);
+      }
+    });
+
+    it("splits newline-free content without rescanning it from the start", async () => {
+      // The backward scan for a newline has to stop at the start of the piece.
+      // Searching the whole string instead runs to index 0 for every piece when
+      // the content holds no newline at all — quadratic in the file, where the
+      // released scan was linear because it stopped at the window. A one-line
+      // bundle is exactly what the minified heuristic routes to this code, and
+      // MAX_FILE_BYTES lets it reach 5 MB, so this is an ordinary input rather
+      // than a contrived one.
+      //
+      // The bound is deliberately loose: bounded scanning does this in tens of
+      // milliseconds and rescanning takes seconds. Anything between the two is
+      // a slow machine, not the defect.
+      const { splitTextToCharCap } = await import("../../src/services/chunk-split.js");
+      const noNewlines = "x".repeat(5 * 1024 * 1024);
+
+      const startedAt = Date.now();
+      const pieces = splitTextToCharCap(noNewlines, 2000);
+      const elapsed = Date.now() - startedAt;
+
+      expect(pieces).toHaveLength(Math.ceil(noNewlines.length / 2000));
+      expect(pieces.map((p) => p.text).join("")).toBe(noNewlines);
+      expect(elapsed).toBeLessThan(1000);
     });
 
     it("gives every piece of a split chunk a distinct id", async () => {

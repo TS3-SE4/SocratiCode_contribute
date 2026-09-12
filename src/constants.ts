@@ -195,12 +195,14 @@ const DEFAULT_MAX_CHUNK_CHARS = 2000;
  * Override with MAX_CHUNK_CHARS when the embedding model's context is smaller
  * than the default assumes.
  *
- * The cap is a split boundary on every path, not a truncation point.
+ * On a collection indexed as format 2 the cap is a split boundary on every
+ * path, not a truncation point. A collection stored below that version keeps
+ * truncating, so its stored representation stays what its profile says.
  * `chunkFileContent` and `chunkArtifactContent` both cut by line count
  * (CHUNK_SIZE), so a chunk can come out longer than a cap counted in
  * characters; `splitToCharCap` then divides it into as many chunks as it needs.
- * No content is dropped, so a lower cap yields more chunks rather than less
- * indexed content. (Chunks still overlap where the strategy that produced them
+ * On format 2 no content is dropped, so a lower cap yields more chunks rather
+ * than less indexed content. (Chunks still overlap where the strategy that produced them
  * overlaps — CHUNK_OVERLAP lines on the line-based path — and a piece holding
  * only whitespace is dropped.)
  *

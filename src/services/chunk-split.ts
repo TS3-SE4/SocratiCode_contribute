@@ -88,31 +88,41 @@ export function splitTextToCharCap(content: string, maxChunkChars: number): Text
     let end = Math.min(offset + maxChunkChars, content.length);
 
     if (end < content.length) {
-      // The last newline at or before the cap. lastIndexOf searches back from
-      // `end - 1` so the newline itself is inside the piece; ending just past
-      // it keeps the line whole.
-      const newline = content.lastIndexOf("\n", end - 1);
+      // The last newline at or before the cap: scan back from `end - 1` so the
+      // newline itself is inside the piece, and ending just past it keeps the
+      // line whole.
+      //
+      // Bounded at `offset` deliberately. String.lastIndexOf has no lower
+      // bound, so on content holding no newline at all it would run back to
+      // index 0 for every piece — quadratic in the file, where the released
+      // scan was linear because it stopped at the window. That input is not
+      // hypothetical: a one-line bundle is what MAX_AVG_LINE_LENGTH routes
+      // here, MAX_FILE_BYTES lets it reach 5 MB, and chunking is synchronous.
+      let newline = -1;
+      for (let i = end - 1; i >= offset; i--) {
+        if (content.charCodeAt(i) === 0x0a) {
+          newline = i;
+          break;
+        }
+      }
       if (newline >= offset) {
         end = newline + 1;
       } else {
-        // No newline in this span: split at the cap. A surrogate pair must not
-        // be divided — JavaScript strings are UTF-16 code units, so a character
-        // outside the BMP occupies two of them, and cutting between them leaves
-        // a lone surrogate on each side. Both become U+FFFD by the time the
-        // text reaches the embedding request and the stored payload.
+        // No newline in this span: split at the cap — but never through a pair
+        // that means one thing on its own.
+        //
+        // A surrogate pair is one character held in two UTF-16 units. Split it
+        // and both halves become U+FFFD, so the character is lost — the very
+        // thing this split exists to prevent. A CRLF is one line ending, and
+        // splitting it leaves a blank line the file does not have.
         const before = content.charCodeAt(end - 1);
         const after = content.charCodeAt(end);
         const surrogatePair =
           before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
-        // A CRLF is one line ending, not two characters to divide. Cutting
-        // between them leaves a stray carriage return at the end of one piece
-        // and starts the next with a bare newline, which reads as a blank line
-        // the file does not have.
         const lineEnding = before === 0x0d && after === 0x0a;
         if (surrogatePair || lineEnding) {
-          // Leave the whole pair to the next piece. If that would empty this
-          // one, take the pair instead — a piece of cap + 1 is better than a
-          // loop that never advances.
+          // Move the boundary off the pair: back one, or forward one where
+          // going back would leave this piece empty.
           end = end - 1 > offset ? end - 1 : end + 1;
         }
       }
